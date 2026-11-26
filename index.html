@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShieldGraph</title>
+<meta name="description" content="A browser-native firewall and red-team workbench for AI agent tool calls. Taint tracking, de-obfuscation, SSRF and path guards, and a policy compiler that exports runnable middleware.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/shieldgraph-plot.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="styles.css">
+<script type="module" src="js/app.mjs"></script>
+</head>
+<body>
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-allow" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M6.4 10.3l2.4 2.4 4.8-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-log" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M6 10h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-approval" viewBox="0 0 20 20"><path d="M10 2.6l7.6 13.4H2.4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.6 9v4M11.4 9v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-deny" viewBox="0 0 20 20"><path d="M7 2.5h6l4.5 4.5v6L13 17.5H7L2.5 13V7z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M7.4 7.4l5.2 5.2M12.6 7.4l-5.2 5.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-user" viewBox="0 0 20 20"><circle cx="10" cy="7" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3.8 17c.8-3.4 3.3-5 6.2-5s5.4 1.6 6.2 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-doc" viewBox="0 0 20 20"><path d="M5 2.5h6.5L15 6v11.5H5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M11.5 2.5V6H15M7.5 10h5M7.5 13h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-plan" viewBox="0 0 20 20"><path d="M10 2.2l6.8 3.9v7.8L10 17.8l-6.8-3.9V6.1z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="10" cy="10" r="2" fill="currentColor"/></symbol>
+    <symbol id="i-tool" viewBox="0 0 20 20"><rect x="2.8" y="4.5" width="14.4" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M6 8.5l2.2 1.7L6 11.9M10 12h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-sink" viewBox="0 0 20 20"><path d="M3 10h9M9 6.5l3.5 3.5L9 13.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M15.5 4v12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-hostile" viewBox="0 0 20 20"><path d="M10 2.6l7.6 13.4H2.4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M10 7.6v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="10" cy="13.9" r="1.05" fill="currentColor"/></symbol>
+    <symbol id="i-untrusted" viewBox="0 0 20 20"><path d="M10 2.4l7.6 7.6-7.6 7.6L2.4 10z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="i-internal" viewBox="0 0 20 20"><rect x="4" y="4" width="12" height="12" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
+    <symbol id="i-trusted" viewBox="0 0 20 20"><circle cx="10" cy="10" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="10" cy="10" r="2.2" fill="currentColor"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 20 20"><circle cx="10" cy="10" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M10 2v2.2M10 15.8V18M2 10h2.2M15.8 10H18M4.3 4.3l1.6 1.6M14.1 14.1l1.6 1.6M4.3 15.7l1.6-1.6M14.1 5.9l1.6-1.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 20 20"><path d="M15.8 12.6A6.6 6.6 0 0 1 7.4 4.2a6.6 6.6 0 1 0 8.4 8.4z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-play" viewBox="0 0 20 20"><path d="M6.5 4.5v11l9-5.5z" fill="currentColor"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 20 20"><path d="M6.5 4.5v11M13.5 4.5v11" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 20 20"><path d="M12.5 4.5L7 10l5.5 5.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-next" viewBox="0 0 20 20"><path d="M7.5 4.5L13 10l-5.5 5.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 20 20"><path d="M4.5 9.5a5.6 5.6 0 1 1 1.7 4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M4 5v4.6h4.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-download" viewBox="0 0 20 20"><path d="M10 3v9.5M6 9l4 4 4-4M4 16.5h12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-print" viewBox="0 0 20 20"><path d="M6 7V3h8v4M6 14H4V8h12v6h-2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><rect x="6" y="11.5" width="8" height="5.5" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+    <symbol id="i-mark" viewBox="0 0 32 32"><path d="M16 2.5l11 4v9.2c0 6.6-4.6 11.6-11 13.8C9.6 27.3 5 22.3 5 15.7V6.5z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><circle cx="11" cy="12" r="2.1" fill="currentColor"/><circle cx="21" cy="12" r="2.1" fill="currentColor"/><circle cx="16" cy="21" r="2.1" fill="currentColor"/><path d="M11 12l5 9 5-9" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+  </defs>
+</svg>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="bar">
+  <a class="brand" href="#" aria-label="ShieldGraph home">
+    <svg class="brand-mark" aria-hidden="true"><use href="#i-mark"/></svg>
+    <span class="wordmark">ShieldGraph</span>
+  </a>
+  <nav class="tabs" role="tablist" aria-label="Views">
+    <button type="button" role="tab" id="tab-workbench" aria-controls="view-workbench" aria-selected="true">Workbench</button>
+    <button type="button" role="tab" id="tab-playground" aria-controls="view-playground" aria-selected="false" tabindex="-1">Playground</button>
+    <button type="button" role="tab" id="tab-benchmark" aria-controls="view-benchmark" aria-selected="false" tabindex="-1">Benchmark</button>
+    <button type="button" role="tab" id="tab-policy" aria-controls="view-policy" aria-selected="false" tabindex="-1">Policy</button>
+  </nav>
+  <div class="bar-tools">
+    <fieldset class="seg" id="preset-group">
+      <legend class="vh">Policy preset</legend>
+      <label><input type="radio" name="preset" value="permissive"><span>Permissive</span></label>
+      <label><input type="radio" name="preset" value="balanced" checked><span>Balanced</span></label>
+      <label><input type="radio" name="preset" value="zeroTrust"><span>Zero-Trust</span></label>
+      <label class="seg-custom" hidden><input type="radio" name="preset" value="custom"><span>Custom</span></label>
+    </fieldset>
+    <button type="button" class="icon-btn" id="theme-toggle" aria-label="Switch to dark theme"><svg aria-hidden="true"><use href="#i-moon"/></svg></button>
+    <button type="button" class="icon-btn" id="print-btn" aria-label="Print the security audit report"><svg aria-hidden="true"><use href="#i-print"/></svg></button>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+  <section class="view view-workbench" id="view-workbench" role="tabpanel" aria-labelledby="tab-workbench">
+    <aside class="rail" aria-label="Scenarios">
+      <h2 class="rail-h">Attacks</h2>
+      <ul class="scn-list" id="list-attack"></ul>
+      <h2 class="rail-h">Benign workflows</h2>
+      <ul class="scn-list" id="list-benign"></ul>
+    </aside>
+
+    <div class="stage">
+      <div class="stage-head">
+        <h1 id="scn-title">Scenario</h1>
+        <div class="verdict" id="scn-verdict" aria-live="polite"></div>
+      </div>
+      <div class="graph-wrap">
+        <div class="graph" id="graph" role="group" aria-label="Taint and tool-call flow graph"></div>
+      </div>
+      <div class="transport" role="group" aria-label="Trace playback">
+        <button type="button" class="icon-btn" id="step-reset" aria-label="Show the whole trace"><svg aria-hidden="true"><use href="#i-reset"/></svg></button>
+        <button type="button" class="icon-btn" id="step-prev" aria-label="Previous step"><svg aria-hidden="true"><use href="#i-prev"/></svg></button>
+        <button type="button" class="icon-btn icon-btn-primary" id="step-play" aria-label="Play the trace step by step"><svg aria-hidden="true"><use href="#i-play"/></svg></button>
+        <button type="button" class="icon-btn" id="step-next" aria-label="Next step"><svg aria-hidden="true"><use href="#i-next"/></svg></button>
+        <output class="step-out" id="step-out" aria-live="polite"></output>
+        <div class="graph-legend" aria-hidden="true">
+          <span class="lg lg-flow">Flow</span><span class="lg lg-taint">Taint</span><span class="lg lg-blocked">Stopped</span>
+        </div>
+      </div>
+      <section class="story" aria-labelledby="story-h">
+        <h2 id="story-h">What happens</h2>
+        <p id="scn-summary"></p>
+        <dl class="facts" id="scn-facts"></dl>
+      </section>
+    </div>
+
+    <aside class="inspector" id="inspector" aria-labelledby="insp-h" tabindex="-1">
+      <h2 id="insp-h">Inspector</h2>
+      <div id="insp-body"></div>
+    </aside>
+  </section>
+
+  <section class="view view-playground" id="view-playground" role="tabpanel" aria-labelledby="tab-playground" hidden>
+    <form class="pg-form" id="pg-form" autocomplete="off">
+      <h1>Red-team playground</h1>
+      <div class="field">
+        <label for="pg-base">Start from</label>
+        <select id="pg-base"></select>
+      </div>
+      <div class="field">
+        <label for="pg-user">User prompt (trusted)</label>
+        <textarea id="pg-user" rows="2" spellcheck="false"></textarea>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="pg-origin">Untrusted source</label>
+          <select id="pg-origin">
+            <option value="web page">Web page</option>
+            <option value="inbound email">Email</option>
+            <option value="third-party README">Repository README</option>
+            <option value="shared document">PDF or shared doc</option>
+            <option value="webhook payload">Webhook</option>
+            <option value="tool output">Tool output</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="pg-trust">Trust</label>
+          <select id="pg-trust"><option value="untrusted">Untrusted</option><option value="internal">Internal</option></select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="pg-source">Untrusted content</label>
+        <textarea id="pg-source" rows="6" spellcheck="false"></textarea>
+      </div>
+      <div class="fuzz" role="group" aria-labelledby="fuzz-l">
+        <span id="fuzz-l" class="fuzz-l">Obfuscate content</span>
+        <button type="button" data-fuzz="base64">Base64 wrap</button>
+        <button type="button" data-fuzz="zerowidth">Zero-width split</button>
+        <button type="button" data-fuzz="homoglyph">Homoglyphs</button>
+        <button type="button" data-fuzz="percent">Percent-encode</button>
+        <button type="button" data-fuzz="entities">HTML entities</button>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="pg-tool">Tool call</label>
+          <select id="pg-tool"></select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="pg-args">Arguments (JSON)</label>
+        <textarea id="pg-args" rows="5" spellcheck="false"></textarea>
+        <p class="field-err" id="pg-args-err" role="alert"></p>
+      </div>
+    </form>
+    <div class="pg-result" aria-live="polite">
+      <div class="pg-verdict" id="pg-verdict"></div>
+      <div class="graph graph-mini" id="pg-graph" role="group" aria-label="Playground flow graph"></div>
+      <div id="pg-detail"></div>
+    </div>
+  </section>
+
+  <section class="view view-benchmark" id="view-benchmark" role="tabpanel" aria-labelledby="tab-benchmark" hidden>
+    <h1>Benchmark</h1>
+    <div class="table-scroll">
+      <table class="metrics" id="metrics-table">
+        <caption>Per tool call, across all 14 scenarios. Intercepted means blocked or held for human approval.</caption>
+        <thead><tr><th scope="col">Policy</th><th scope="col">Malicious caught</th><th scope="col">Benign interrupted</th><th scope="col">Precision</th><th scope="col">Recall</th><th scope="col">F1</th><th scope="col">False positive rate</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <h2>Decision matrix</h2>
+    <div class="table-scroll">
+      <table class="matrix" id="matrix-table">
+        <caption>Each row is one tool call. Ground truth is the label the scenario author assigned.</caption>
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="view view-policy" id="view-policy" role="tabpanel" aria-labelledby="tab-policy" hidden>
+    <div class="pol-edit">
+      <h1>Policy compiler</h1>
+      <div class="field">
+        <label for="pol-json">Policy manifest (JSON)</label>
+        <textarea id="pol-json" rows="22" spellcheck="false"></textarea>
+      </div>
+      <div class="pol-status" id="pol-status" role="status"></div>
+      <div class="actions">
+        <button type="button" class="btn btn-primary" id="pol-apply">Apply policy</button>
+        <button type="button" class="btn" id="pol-reset">Reset to preset</button>
+      </div>
+      <h2>Export</h2>
+      <div class="actions">
+        <button type="button" class="btn" id="exp-guard"><svg aria-hidden="true"><use href="#i-download"/></svg>shieldgraph-guard.mjs</button>
+        <button type="button" class="btn" id="exp-policy"><svg aria-hidden="true"><use href="#i-download"/></svg>policy.json</button>
+        <button type="button" class="btn" id="exp-print"><svg aria-hidden="true"><use href="#i-print"/></svg>Audit report</button>
+      </div>
+      <p class="exp-status" id="exp-status" role="status"></p>
+    </div>
+    <div class="pol-rules">
+      <h2>Rules</h2>
+      <div class="table-scroll">
+        <table class="rules" id="rules-table">
+          <caption>Change an action here and the manifest updates.</caption>
+          <thead><tr><th scope="col">Rule</th><th scope="col">Severity</th><th scope="col">Action</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<section class="report" id="report" aria-label="Printable security audit report"></section>
+</body>
+</html>
