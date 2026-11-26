@@ -65,6 +65,7 @@ export const RULES = {
   symlinkCreate: ['high', 'Command creates a symbolic link.'],
   decodeExec: ['high', 'Command decodes an encoded payload.'],
   inlineInterpreter: ['medium', 'Interpreter runs inline code.'],
+  scriptSpawn: ['high', 'Inline script spawns processes or opens connections.'],
   commandSubstitution: ['medium', 'Nested command substitution.'],
   unbalancedQuote: ['medium', 'Unbalanced quotes in a command.'],
   persistenceWrite: ['high', 'Shell redirect into a startup or hook file.'],
@@ -279,7 +280,7 @@ export function traceValue(value, ctx) {
   const v = lower(deobfuscate(value).text).trim();
   const result = { endorsed: false, sources: [] };
   if (!v) return result;
-  if (v.length >= 3 && ctx.trustedLower.includes(v)) result.endorsed = true;
+  if (v.length >= 3 && containsToken(ctx.trustedLower, v)) result.endorsed = true;
   for (const src of ctx.sources) {
     if (v.length >= 6 && src.haystack.includes(v)) {
       result.sources.push({ id: src.id, origin: src.origin, how: 'verbatim', excerpt: v.slice(0, 80) });
@@ -293,12 +294,30 @@ export function traceValue(value, ctx) {
   return result;
 }
 
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// True when needle appears in hay as a whole token, not inside a longer word,
+// address or number (so "a@x.example" is not endorsed by "ana@x.example").
+export function containsToken(hay, needle) {
+  const n = String(needle).trim();
+  if (!n) return false;
+  return new RegExp(`(^|[^\\w@.+-])${escapeRegExp(n)}($|[^\\w@+-]|\\.(?!\\w))`, 'i').test(hay);
+}
+
+function accountTokens(text) {
+  return (String(text).match(/\d[\d\s-]{3,}\d/g) || []).map((t) => t.replace(/\D/g, '')).filter((d) => d.length >= 6);
+}
+
 function entityEndorsed(entity, ctx) {
   const e = lower(entity).trim();
   if (!e) return false;
-  if (ctx.trustedLower.includes(e)) return true;
+  if (containsToken(ctx.trustedLower, e)) return true;
   const digits = e.replace(/\D/g, '');
-  if (digits.length >= 6 && ctx.trustedLower.replace(/\D/g, '').includes(digits)) return true;
+  if (digits.length >= 6 && digits.length === e.replace(/[\s-]/g, '').length) {
+    return accountTokens(ctx.trustedLower).includes(digits);
+  }
   return false;
 }
 
@@ -397,21 +416,31 @@ function shellFindings(cmd, ctx) {
   const out = [...analysis.findings];
   for (const c of analysis.commands) {
     for (const arg of c.args) for (const url of extractUrls(arg)) out.push({ rule: '__url', url });
-    if (c.name === 'cat' || c.name === 'cp' || c.name === 'tar' || c.name === 'zip' || c.name === 'scp') {
-      for (const arg of c.args) if (!arg.startsWith('-')) out.push({ rule: '__path', path: arg });
+    // Any command can read a file (head, base64, grep, docker --env-file), so every
+    // non-flag word and redirect target is checked as a path.
+    for (const arg of c.args) {
+      const value = arg.startsWith('-') && arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : arg;
+      if (!value.startsWith('-') && !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) out.push({ rule: '__path', path: value });
     }
+    for (const r of c.redirects) out.push({ rule: '__path', path: r.target });
   }
   // Command injection: operators that appear inside text copied from untrusted content.
+  // The outer command and every nested script (sh -c, substitutions) are checked.
   const metaFeatures = analysis.features.filter((f) => ['chain', 'pipe', 'substitution', 'background'].includes(f));
   if (metaFeatures.length) {
-    const cmdLower = lower(deobfuscate(cmd).text);
-    for (const src of ctx.sources) {
-      const run = longestCommonString(cmdLower, src.haystack);
-      if (run.length >= 6 && /[;|&`]|\$\(|\n/.test(run) && !ctx.trustedLower.includes(run)) {
-        out.push({ rule: 'shellMetaFromUntrusted', severity: 'critical', message: `Shell operators came from ${src.origin}: "${run.trim().slice(0, 60)}".` });
-        break;
+    let hit = null;
+    for (const text of [cmd, ...(analysis.nested || [])]) {
+      const textLower = lower(deobfuscate(text).text);
+      for (const src of ctx.sources) {
+        const run = longestCommonString(textLower, src.haystack);
+        if (run.length >= 6 && /[;|&`]|\$\(|\n/.test(run) && !ctx.trustedLower.includes(run)) {
+          hit = { rule: 'shellMetaFromUntrusted', severity: 'critical', message: `Shell operators came from ${src.origin}: "${run.trim().slice(0, 60)}".` };
+          break;
+        }
       }
+      if (hit) break;
     }
+    if (hit) out.push(hit);
   }
   return { analysis, findings: out };
 }
@@ -439,7 +468,12 @@ function argFindings(tool, spec, args, ctx, policy) {
       for (const f of res.findings) {
         if (f.rule === '__url') for (const g of urlFindings(f.url, ctx, policy, false)) findings.push({ ...g, arg: name });
         else if (f.rule === '__path') {
-          for (const g of analyzePath(f.path, { workspaceRoot: policy.workspaceRoot, homeDir: policy.homeDir }).findings) findings.push({ ...g, arg: name });
+          // Keep only the findings that cannot be ordinary shell use: credential files
+          // and traversal hidden with encoding. `cd ..` and `ls /usr/bin` stay quiet.
+          const res = analyzePath(f.path, { workspaceRoot: policy.workspaceRoot, homeDir: policy.homeDir });
+          for (const g of res.findings) {
+            if (g.rule === 'sensitivePath' || (g.rule === 'pathTraversal' && res.encoded)) findings.push({ ...g, arg: name });
+          }
         } else findings.push({ ...f, arg: name });
       }
     } else if (kind === 'markdown') {

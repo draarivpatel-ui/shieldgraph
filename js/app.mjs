@@ -666,7 +666,7 @@ async function updateDigest() {
 
 function buildReport() {
   const bench = benchmarks();
-  const generated = new Date().toISOString().slice(0, 10);
+  const generated = new Date().toLocaleDateString('en-CA');
   renderReport($('#report'), { policy: activePolicy(), digest: state.digest || '0'.repeat(64), bench, activeKey: state.presetId, labels: LABELS, generated });
 }
 

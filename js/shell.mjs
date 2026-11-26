@@ -5,6 +5,41 @@ const INTERPRETERS = ['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'python', 'pyt
 const NETWORK_TOOLS = ['curl', 'wget', 'nc', 'ncat', 'netcat', 'socat', 'telnet', 'ssh', 'scp', 'sftp', 'rsync', 'ftp', 'nslookup', 'dig', 'host'];
 const PRIVILEGE_TOOLS = ['sudo', 'su', 'doas', 'chmod', 'chown', 'setfacl', 'crontab', 'launchctl', 'systemctl'];
 const DESTRUCTIVE = ['rm', 'mkfs', 'dd', 'shred', 'truncate'];
+const SHELLS = ['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish'];
+const SCRIPT_SPAWN = /\b(os\.system|os\.popen|subprocess|pty\.spawn|child_process|execSync|spawnSync|socket\.|urllib|requests\.(get|post)|http\.request|https\.request|fetch\(|Net::HTTP|open-uri|IO\.popen|system\(|exec\(|eval\()/;
+const NESTING_LIMIT = 3;
+
+// Bodies of $( ), <( ), >( ) and backtick substitutions, found by balancing parentheses.
+export function extractSubstitutions(text) {
+  const src = String(text ?? '');
+  const out = [];
+  for (let i = 0; i < src.length; i += 1) {
+    const two = src.slice(i, i + 2);
+    if (two === '$(' || two === '<(' || two === '>(') {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < src.length && depth > 0; j += 1) {
+        if (src[j] === '(') depth += 1;
+        else if (src[j] === ')') depth -= 1;
+      }
+      out.push(src.slice(i + 2, depth === 0 ? j - 1 : j));
+      i = j - 1;
+    } else if (src[i] === '`') {
+      const end = src.indexOf('`', i + 1);
+      out.push(src.slice(i + 1, end === -1 ? src.length : end));
+      i = end === -1 ? src.length : end;
+    }
+  }
+  return out.filter((body) => body.trim());
+}
+
+// The script passed to sh -c (also -lc, -ec, and similar flag bundles).
+function inlineScript(c) {
+  for (let i = 0; i < c.args.length; i += 1) {
+    if (/^-[a-z]*c[a-z]*$/i.test(c.args[i]) && i + 1 < c.args.length) return c.args[i + 1];
+  }
+  return null;
+}
 
 export function lexShell(command) {
   const src = String(command ?? '');
@@ -153,8 +188,9 @@ function commandName(argv) {
  * Lexes a command line and lists dangerous constructs.
  * @returns {{commands: object[], features: string[], findings: object[]}}
  */
-export function analyzeShell(command) {
-  const { tokens, features } = lexShell(command);
+export function analyzeShell(command, depth = 0) {
+  const { tokens, features: ownFeatures } = lexShell(command);
+  const features = [...ownFeatures];
   const commands = splitCommands(tokens).map((c) => ({ ...c, ...commandName(c.argv) }));
   const findings = [];
   const add = (rule, severity, message) => findings.push({ rule, severity, message });
@@ -173,7 +209,10 @@ export function analyzeShell(command) {
     }
     if (c.name === 'ln' && /(^|\s)-[a-z]*s/i.test(args)) add('symlinkCreate', 'high', 'ln -s can plant a link that escapes the workspace.');
     if (c.name === 'base64' && /(^|\s)(-d|--decode|-D)\b/.test(args)) add('decodeExec', 'high', 'base64 decoding inside a command often hides a payload.');
-    if (INTERPRETERS.includes(c.name) && /(^|\s)-(c|e)\b/.test(args)) add('inlineInterpreter', 'medium', `${c.name} runs an inline script.`);
+    if (INTERPRETERS.includes(c.name) && /(^|\s)-[a-z]*(c|e)\b/i.test(args)) {
+      add('inlineInterpreter', 'medium', `${c.name} runs an inline script.`);
+      if (!SHELLS.includes(c.name) && SCRIPT_SPAWN.test(args)) add('scriptSpawn', 'high', `${c.name} inline code spawns processes or opens connections.`);
+    }
     if (c.name === 'eval') add('inlineInterpreter', 'high', 'eval executes a constructed string.');
     if (c.name === 'git' && /config\b.*core\.(hooksPath|sshCommand|pager|editor)/.test(args)) add('privilegeChange', 'high', 'git config redirects a code-executing setting.');
     for (const r of c.redirects) {
@@ -184,5 +223,26 @@ export function analyzeShell(command) {
   if (/\/dev\/(tcp|udp)\//.test(text) && !findings.some((f) => f.rule === 'reverseShell')) add('reverseShell', 'critical', 'Command references /dev/tcp, a raw socket.');
   if (features.includes('substitution')) add('commandSubstitution', 'medium', 'Command substitution runs a nested command.');
   if (features.includes('unbalancedQuote')) add('unbalancedQuote', 'medium', 'Quotes are unbalanced, a common breakout sign.');
-  return { commands, features, findings };
+
+  // Wrappers do not hide anything: re-analyze sh -c scripts and substitution bodies.
+  const nested = [];
+  if (depth < NESTING_LIMIT) {
+    const direct = [];
+    for (const c of commands) {
+      const script = SHELLS.includes(c.name) ? inlineScript(c) : null;
+      if (script) direct.push(script);
+    }
+    direct.push(...extractSubstitutions(text));
+    nested.push(...direct);
+    for (const inner of direct) {
+      const sub = analyzeShell(inner, depth + 1);
+      for (const f of sub.findings) {
+        if (!findings.some((g) => g.rule === f.rule && g.message === f.message)) findings.push({ ...f, message: f.message.startsWith('Nested') ? f.message : `Nested command: ${f.message}` });
+      }
+      for (const f of sub.features) if (!features.includes(f)) features.push(f);
+      commands.push(...sub.commands);
+      for (const n of sub.nested) if (!nested.includes(n)) nested.push(n);
+    }
+  }
+  return { commands, features, findings, nested };
 }
