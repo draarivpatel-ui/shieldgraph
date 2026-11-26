@@ -1170,3 +1170,112 @@ test('throwing context getters return guardError in direct evaluation and the co
     assert.ok(verdict.findings.some((f) => f.rule === 'guardError' && f.message.includes('context boom')));
   }
 });
+
+test('prepared context keys include prototype-inherited effective trust settings', () => {
+  const base = clonePolicy(PRESETS.balanced);
+  delete base.trustInternal;
+  const trustTrue = Object.assign(Object.create({ trustInternal: true }), base);
+  const trustFalse = Object.assign(Object.create({ trustInternal: false }), base);
+  const cmd = 'abcde;fghijklm';
+  const raw = { untrusted: [{ origin: 'internal file', trust: 'internal', text: cmd }] };
+  const preparedTrue = prepareContext(raw, trustTrue);
+  assert.equal(preparedTrue.sources.length, 0);
+  const call = { tool: 'shell_exec', args: { cmd } };
+  const directFalse = decide(call, raw, trustFalse);
+  assert.equal(directFalse.decision, 'deny');
+  assert.ok(directFalse.findings.some((f) => f.rule === 'shellMetaFromUntrusted'));
+  const mismatched = decide(call, preparedTrue, trustFalse);
+  assert.equal(mismatched.decision, 'deny');
+  assert.ok(mismatched.findings.some((f) => f.rule === 'budgetExceeded' && f.message.includes('different policy')));
+  const preparedFalse = prepareContext(raw, trustFalse);
+  assert.equal(preparedFalse.sources.length, 1);
+  const reverseMismatched = decide(call, preparedFalse, trustTrue);
+  assert.equal(reverseMismatched.decision, 'deny');
+  assert.ok(reverseMismatched.findings.some((f) => f.rule === 'budgetExceeded' && f.message.includes('different policy')));
+});
+
+test('direct and compiled contexts reject array and map subclasses and hostile own properties', async () => {
+  class MyArr extends Array {}
+  class MyMap extends Map {}
+  const arraySubclass = new MyArr();
+  arraySubclass.push('ordinary');
+  const mapSubclass = new MyMap();
+  mapSubclass.set('k', 'v');
+  const mapWithProto = new Map();
+  Object.defineProperty(mapWithProto, '__proto__', { value: { polluted: true }, enumerable: true });
+  const arrayWithNamedProperty = ['ordinary'];
+  Object.defineProperty(arrayWithNamedProperty, 'meta', {
+    value: { nested: JSON.parse('{"__proto__":{"polluted":true}}') },
+    enumerable: true
+  });
+  const cases = [
+    ['array subclass', arraySubclass],
+    ['map subclass', mapSubclass],
+    ['map own proto', mapWithProto],
+    ['array named property', arrayWithNamedProperty]
+  ];
+  const { mod } = await loadCompiled('balanced');
+  const call = { tool: 'read_file', args: { path: 'src/app.ts' } };
+  for (const [label, value] of cases) {
+    const context = { extra: value };
+    for (const verdict of [decide(call, context), mod.checkToolCall(call, context)]) {
+      assert.equal(verdict.decision, 'deny', label);
+      assert.ok(verdict.findings.some((f) => f.rule === 'budgetExceeded'), label);
+    }
+  }
+});
+
+test('repetitive trusted operator input stays fast and later untrusted occurrences still deny', async () => {
+  const cmd = 'a;'.repeat(1000);
+  assert.equal(cmd.length, 2000);
+  const context = { trusted: [cmd], untrusted: [{ origin: 'page', text: cmd }] };
+  const call = { tool: 'shell_exec', args: { cmd } };
+  const directStart = performance.now();
+  const direct = decide(call, context);
+  const directMs = performance.now() - directStart;
+  assert.equal(direct.decision, 'allow');
+  assert.ok(!direct.findings.some((f) => f.rule === 'shellMetaFromUntrusted' || f.rule === 'guardError'));
+  assert.ok(directMs < 100, `direct evaluation took ${directMs.toFixed(1)} ms`);
+
+  const { mod } = await loadCompiled('balanced');
+  const guard = mod.createGuard();
+  guard.addTrusted(cmd);
+  guard.addUntrusted(cmd, 'page');
+  const compiledStart = performance.now();
+  const compiled = guard.check(call);
+  const compiledMs = performance.now() - compiledStart;
+  assert.equal(compiled.decision, 'allow');
+  assert.ok(!compiled.findings.some((f) => f.rule === 'shellMetaFromUntrusted' || f.rule === 'guardError'));
+  assert.ok(compiledMs < 100, `compiled guard took ${compiledMs.toFixed(1)} ms`);
+
+  const laterCmd = 'abcde;fghijklm';
+  const trustedCover = 'abcde;fghij';
+  const sourceText = 'abcde;fghijZ noise abcde;fghijklm';
+  const laterCall = { tool: 'shell_exec', args: { cmd: laterCmd } };
+  const laterDirect = decide(laterCall, { trusted: [trustedCover], untrusted: [{ origin: 'page', text: sourceText }] });
+  const laterGuard = mod.createGuard();
+  laterGuard.addTrusted(trustedCover);
+  laterGuard.addUntrusted(sourceText, 'page');
+  const laterCompiled = laterGuard.check(laterCall);
+  for (const verdict of [laterDirect, laterCompiled]) {
+    assert.equal(verdict.decision, 'deny');
+    assert.ok(verdict.findings.some((f) => f.rule === 'shellMetaFromUntrusted'));
+  }
+});
+
+test('operator matcher step budget fails closed with guardError in direct evaluation and compiled guard', async () => {
+  const cmd = 'a;'.repeat(2000);
+  const coveredPrefix = 'a;'.repeat(1999);
+  const context = { trusted: [coveredPrefix], untrusted: [{ origin: 'page', text: coveredPrefix }] };
+  const call = { tool: 'shell_exec', args: { cmd } };
+  const direct = decide(call, context);
+  const { mod } = await loadCompiled('balanced');
+  const guard = mod.createGuard();
+  guard.addTrusted(coveredPrefix);
+  guard.addUntrusted(coveredPrefix, 'page');
+  const compiled = guard.check(call);
+  for (const verdict of [direct, compiled]) {
+    assert.equal(verdict.decision, 'deny');
+    assert.ok(verdict.findings.some((f) => f.rule === 'guardError' && /step budget/.test(f.message)));
+  }
+});

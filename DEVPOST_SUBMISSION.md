@@ -37,7 +37,7 @@ ShieldGraph is plain JavaScript ES modules, HTML and CSS with zero dependencies,
 
 The flow graph is hand-built SVG, the display face ShieldGraph Plot is a monoline font drawn stroke by stroke with a Python script, and the page runs under a strict Content Security Policy with no inline script and no markup ever built from payload text.
 
-Testing covers 331 Node unit tests (including bypass attempts, benign false-positive cases, guard parity, WCAG contrast computed from the real color tokens, and a scanner that proves itself on planted probes) plus a headless Chrome audit at desktop, tablet and phone sizes that clicks through every view, runs the fuzzer and an XSS payload, downloads the guard and runs it in Node, and checks the audit sheet prints on exactly one US Letter page.
+Testing covers 336 Node unit tests (including bypass attempts, benign false-positive cases, guard parity, WCAG contrast computed from the real color tokens, and a scanner that proves itself on planted probes) plus a headless Chrome audit at desktop, tablet and phone sizes that clicks through every view, runs the fuzzer and an XSS payload, downloads the guard and runs it in Node, and checks the audit sheet prints on exactly one US Letter page.
 
 ## Challenges we ran into
 

@@ -22,9 +22,6 @@ const downloadDir = path.join(tmpRoot, 'downloads');
 const artifactsRoot = updateArtifacts ? path.join(root, 'docs') : path.join(tmpRoot, 'artifacts');
 const shotsDir = path.join(artifactsRoot, 'screenshots');
 const auditPdfPath = path.join(artifactsRoot, 'security-audit-sample.pdf');
-fs.mkdirSync(profileDir, { recursive: true });
-fs.mkdirSync(downloadDir, { recursive: true });
-fs.mkdirSync(shotsDir, { recursive: true });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
@@ -109,11 +106,7 @@ class CDP {
 }
 
 async function main() {
-  const server = createServer(root);
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const origin = `http://127.0.0.1:${server.address().port}`;
-  const port = await freePort();
-
+  let server = null;
   let chrome = null;
   let chromeDone = Promise.resolve(null);
   let chromeStartupError = null;
@@ -121,6 +114,17 @@ async function main() {
   let cdp;
   const errors = { console: [], exceptions: [], failed: [], external: [], badStatus: [] };
   try {
+    fs.mkdirSync(profileDir, { recursive: true });
+    fs.mkdirSync(downloadDir, { recursive: true });
+    fs.mkdirSync(shotsDir, { recursive: true });
+    server = createServer(root);
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const port = await freePort();
+
     chrome = spawn(chromePath, [
       '--headless=new', '--mute-audio', '--no-first-run', '--no-default-browser-check',
       `--user-data-dir=${profileDir}`, `--remote-debugging-port=${port}`,
@@ -468,7 +472,7 @@ async function main() {
         await chromeDone;
         clearTimeout(timer);
       }
-      try { server.close(); } catch { }
+      if (server) try { server.close(); } catch { }
     } finally {
       let cleanupError = null;
       try {

@@ -436,6 +436,8 @@ const PROTO_KEY_CONTEXT_MESSAGE = 'Context object contains an own __proto__ key.
 const CONTEXT_SNAPSHOT_BUDGET_MESSAGE = `Context snapshot inspects more than ${WORK_LIMITS.maxContextKeys} properties or elements.`;
 const CONTEXT_SNAPSHOT_DEPTH_MESSAGE = 'Context snapshot is cyclic or nested too deeply.';
 const CONTEXT_UNSUPPORTED_MESSAGE = 'Context object contains an unsupported function or class instance.';
+const CONTEXT_ARRAY_PROPERTY_MESSAGE = 'Context array contains an own property outside its canonical indexed elements.';
+const CONTEXT_MAP_PROPERTY_MESSAGE = 'Context map contains an own property.';
 const PREPARED_POLICY_MISMATCH_MESSAGE = 'Prepared context was created under a different policy.';
 
 function immutableQuotaCounts(counts) {
@@ -492,6 +494,33 @@ function countContextInspection(state) {
   return true;
 }
 
+function arrayOwnPropertiesAreCanonical(value, state) {
+  const length = value.length;
+  for (const key of Object.getOwnPropertyNames(value)) {
+    if (!countContextInspection(state)) return false;
+    if (key === 'length') continue;
+    const index = Number(key);
+    if (!Number.isInteger(index) || index < 0 || index >= length || String(index) !== key) return false;
+  }
+  const arraySymbols = Object.getOwnPropertySymbols(value);
+  for (let i = 0; i < arraySymbols.length; i += 1) {
+    if (!countContextInspection(state)) return false;
+  }
+  return arraySymbols.length === 0;
+}
+
+function mapOwnPropertiesAreAbsent(value, state) {
+  const names = Object.getOwnPropertyNames(value);
+  for (let i = 0; i < names.length; i += 1) {
+    if (!countContextInspection(state)) return false;
+  }
+  const symbols = Object.getOwnPropertySymbols(value);
+  for (let i = 0; i < symbols.length; i += 1) {
+    if (!countContextInspection(state)) return false;
+  }
+  return names.length === 0 && symbols.length === 0;
+}
+
 function snapshotArrayValue(value, state, depth) {
   const copy = [];
   try {
@@ -501,14 +530,6 @@ function snapshotArrayValue(value, state, depth) {
         if (!countContextInspection(state)) break;
         copy[i] = snapshotContextValue(value[i], state, depth + 1);
       }
-    }
-    if (countContextInspection(state) && hasOwn(value, '__proto__') && countContextInspection(state)) {
-      Object.defineProperty(copy, '__proto__', {
-        value: snapshotContextValue(value.__proto__, state, depth + 1),
-        enumerable: true,
-        writable: false,
-        configurable: false
-      });
     }
   } finally {
     state.active.delete(value);
@@ -571,16 +592,36 @@ function snapshotContextValue(value, state, depth) {
   }
   state.active.add(value);
   let copy;
-  if (Array.isArray(value)) copy = snapshotArrayValue(value, state, depth);
-  else if (value instanceof Map) copy = snapshotMapValue(value, state, depth);
-  else {
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype === Object.prototype || prototype === null) copy = snapshotPlainObjectValue(value, state, depth);
-    else {
+  const prototype = Object.getPrototypeOf(value);
+  if (Array.isArray(value)) {
+    if (prototype !== Array.prototype) {
       state.active.delete(value);
       noteContextSnapshot(state, CONTEXT_UNSUPPORTED_MESSAGE);
       return undefined;
     }
+    if (!arrayOwnPropertiesAreCanonical(value, state)) {
+      state.active.delete(value);
+      noteContextSnapshot(state, CONTEXT_ARRAY_PROPERTY_MESSAGE);
+      return undefined;
+    }
+    copy = snapshotArrayValue(value, state, depth);
+  } else if (value instanceof Map) {
+    if (prototype !== Map.prototype) {
+      state.active.delete(value);
+      noteContextSnapshot(state, CONTEXT_UNSUPPORTED_MESSAGE);
+      return undefined;
+    }
+    if (!mapOwnPropertiesAreAbsent(value, state)) {
+      state.active.delete(value);
+      noteContextSnapshot(state, CONTEXT_MAP_PROPERTY_MESSAGE);
+      return undefined;
+    }
+    copy = snapshotMapValue(value, state, depth);
+  } else if (prototype === Object.prototype || prototype === null) copy = snapshotPlainObjectValue(value, state, depth);
+  else {
+    state.active.delete(value);
+    noteContextSnapshot(state, CONTEXT_UNSUPPORTED_MESSAGE);
+    return undefined;
   }
   state.originals.set(copy, value);
   return copy;
@@ -654,8 +695,25 @@ function stablePolicyDatum(value, active = new Set()) {
   return value;
 }
 
+function resolveContextPolicyFlags(policy) {
+  const rawTools = policy?.tools;
+  const configuredTools = rawTools && typeof rawTools === 'object' ? rawTools : {};
+  const tools = Object.create(null);
+  for (const tool of Object.getOwnPropertyNames(configuredTools).sort()) {
+    Object.defineProperty(tools, tool, { value: true, enumerable: true, writable: false, configurable: false });
+  }
+  return { trustInternal: Boolean(policy?.trustInternal), tools: Object.freeze(tools) };
+}
+
+function policyKeyFromContextFlags(policy, flags) {
+  return JSON.stringify({
+    policy: stablePolicyDatum(policy),
+    context: stablePolicyDatum(flags)
+  });
+}
+
 function policyKey(policy) {
-  return JSON.stringify(stablePolicyDatum(policy));
+  return policyKeyFromContextFlags(policy, resolveContextPolicyFlags(policy));
 }
 
 const PREPARED_CONTEXTS = new WeakMap();
@@ -669,6 +727,7 @@ const PREPARED_CONTEXTS = new WeakMap();
 export function prepareContext(context = {}, policy = PRESETS.balanced) {
   const budgetExceeded = [];
   const note = (reason) => { if (!budgetExceeded.includes(reason)) budgetExceeded.push(reason); };
+  const contextPolicy = resolveContextPolicyFlags(policy);
 
   const snapshot = snapshotContextInput(context);
   for (const reason of snapshot.errors) note(reason);
@@ -685,7 +744,7 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
     const start = Math.max(0, rawHistory.length - 256);
     for (let i = start; i < rawHistory.length; i += 1) history.push(rawHistory[i]);
   }
-  const quotaCounts = rejectContext ? null : normalizeQuotaCounts(input.quotaCounts, policy);
+  const quotaCounts = rejectContext ? null : normalizeQuotaCounts(input.quotaCounts, contextPolicy);
 
   let contextItems = 0;
   let retainedChars = 0;
@@ -727,7 +786,7 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
     const sourceInput = rawSources[i];
     const src = sourceInput && typeof sourceInput === 'object' ? sourceInput : { text: sourceInput };
     const trust = src.trust === 'internal' ? 'internal' : 'untrusted';
-    if (trust === 'internal' && policy.trustInternal) continue;
+    if (trust === 'internal' && contextPolicy.trustInternal) continue;
     const held = retain(src.text || '', 'untrusted context');
     const scanKey = sourceInput && typeof sourceInput === 'object' ? snapshot.originals.get(sourceInput) || sourceInput : sourceInput;
     const scan = scanUntrustedSource(scanKey, held.text);
@@ -766,7 +825,7 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
     budgetExceeded
   };
   deepFreeze(prepared);
-  PREPARED_CONTEXTS.set(prepared, policyKey(policy));
+  PREPARED_CONTEXTS.set(prepared, policyKeyFromContextFlags(policy, contextPolicy));
   return prepared;
 }
 
@@ -929,38 +988,73 @@ function markdownFindings(markdown, ctx, policy) {
 
 const SHELL_OPERATOR_PATTERN = /[;|&`]|\$\(|\n/;
 const MIN_OPERATOR_WITNESS = 6;
+const OPERATOR_MATCH_STEP_BUDGET = 8000000;
+const OPERATOR_MATCH_BUDGET_MESSAGE = `Shell operator provenance scan exceeded the step budget of ${OPERATOR_MATCH_STEP_BUDGET} comparisons.`;
+
+function chargeOperatorMatchStep(state, count = 1) {
+  state.steps += count;
+  if (state.steps > OPERATOR_MATCH_STEP_BUDGET) throw new Error(OPERATOR_MATCH_BUDGET_MESSAGE);
+}
 
 function shellOperatorWitness(text, haystack, trustedPartsLower) {
   const x = String(text).slice(0, 4000);
   const y = String(haystack).slice(0, 4000);
   if (x.length < MIN_OPERATOR_WITNESS || y.length < MIN_OPERATOR_WITNESS) return null;
+  const trustedParts = Array.isArray(trustedPartsLower) ? trustedPartsLower : [];
+  const budget = { steps: 0 };
+  for (const part of trustedParts) {
+    chargeOperatorMatchStep(budget, Math.max(1, part.length + x.length));
+    if (part.includes(x)) return null;
+  }
   const positions = new Map();
   for (let j = 0; j + MIN_OPERATOR_WITNESS <= y.length; j += 1) {
+    chargeOperatorMatchStep(budget);
     const key = y.slice(j, j + MIN_OPERATOR_WITNESS);
     if (!positions.has(key)) positions.set(key, []);
     positions.get(key).push(j);
   }
   for (let i = 0; i + MIN_OPERATOR_WITNESS <= x.length; i += 1) {
+    chargeOperatorMatchStep(budget);
     const witness = x.slice(i, i + MIN_OPERATOR_WITNESS);
     const operator = witness.match(SHELL_OPERATOR_PATTERN);
     if (!operator) continue;
     const occurrences = positions.get(witness);
     if (!occurrences) continue;
     for (const yFirst of occurrences) {
+      chargeOperatorMatchStep(budget);
+      if (i > 0 && yFirst > 0) {
+        chargeOperatorMatchStep(budget);
+        if (x[i - 1] === y[yFirst - 1]) {
+          chargeOperatorMatchStep(budget);
+          if (SHELL_OPERATOR_PATTERN.test(x.slice(i - 1, i - 1 + MIN_OPERATOR_WITNESS))) continue;
+        }
+      }
       let start = i;
       let end = i + MIN_OPERATOR_WITNESS;
       let yStart = yFirst;
       let yEnd = yFirst + MIN_OPERATOR_WITNESS;
-      while (start > 0 && yStart > 0 && x[start - 1] === y[yStart - 1]) {
+      while (start > 0 && yStart > 0) {
+        chargeOperatorMatchStep(budget);
+        if (x[start - 1] !== y[yStart - 1]) break;
         start -= 1;
         yStart -= 1;
       }
-      while (end < x.length && yEnd < y.length && x[end] === y[yEnd]) {
+      while (end < x.length && yEnd < y.length) {
+        chargeOperatorMatchStep(budget);
+        if (x[end] !== y[yEnd]) break;
         end += 1;
         yEnd += 1;
       }
       const run = x.slice(start, end);
-      if ((Array.isArray(trustedPartsLower) ? trustedPartsLower : []).some((part) => part.includes(run))) continue;
+      let trusted = false;
+      for (const part of trustedParts) {
+        chargeOperatorMatchStep(budget, Math.max(1, part.length + run.length));
+        if (part.includes(run)) {
+          trusted = true;
+          break;
+        }
+      }
+      if (trusted) continue;
       return {
         text: run,
         operatorIndex: i - start + operator.index,

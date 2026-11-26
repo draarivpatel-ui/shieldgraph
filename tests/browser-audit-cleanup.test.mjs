@@ -25,3 +25,25 @@ test('browser audit exits nonzero and removes its temp directory when Chrome can
   assert.match(`${result.stdout}\n${result.stderr}`, /Chrome failed to start|audit ran to completion/);
   assert.deepEqual(leaked, []);
 });
+
+test('browser audit removes its temp directory when port setup fails before Chrome starts', () => {
+  const patchDir = fs.mkdtempSync(path.join(tmpRoot, 'shieldgraph-preload-'));
+  try {
+    const preload = path.join(patchDir, 'fail-port.cjs');
+    fs.writeFileSync(preload, "const net = require('node:net');\nnet.createServer = function createServer() {\n  throw new Error('forced port allocation failure');\n};\n");
+    const before = new Set(auditTempDirs());
+    const nodeOptions = [process.env.NODE_OPTIONS, `--require ${preload}`].filter(Boolean).join(' ');
+    const result = spawnSync(process.execPath, [auditScript], {
+      env: { ...process.env, NODE_OPTIONS: nodeOptions },
+      encoding: 'utf8',
+      timeout: 15000
+    });
+    const leaked = auditTempDirs().filter((name) => !before.has(name));
+    assert.equal(result.error, undefined);
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /forced port allocation failure/);
+    assert.deepEqual(leaked, []);
+  } finally {
+    fs.rmSync(patchDir, { recursive: true, force: true, maxRetries: 10 });
+  }
+});

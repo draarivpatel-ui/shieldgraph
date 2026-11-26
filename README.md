@@ -81,7 +81,7 @@ ShieldGraph is deterministic static and taint analysis of recorded traces. It is
 ## Tests
 
 ```sh
-npm test         # 331 Node unit tests (engine, policy and guard parity, craft)
+npm test         # 336 Node unit tests (engine, policy and guard parity, craft)
 npm run audit    # headless Chrome audit at 1440x900, 820x1180 and 390x844
 ```
 
