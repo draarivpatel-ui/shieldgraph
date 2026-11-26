@@ -93,7 +93,7 @@ export function analyzePath(input, options = {}) {
   }
   for (const [pattern, label] of SENSITIVE_PATTERNS) {
     if (pattern.test(c.resolved)) {
-      findings.push({ rule: 'sensitivePath', severity: 'critical', message: `${c.resolved} is a ${label}.` });
+      findings.push({ rule: 'sensitivePath', severity: 'critical', message: `${c.resolved} is a protected file (${label}).` });
       break;
     }
   }
