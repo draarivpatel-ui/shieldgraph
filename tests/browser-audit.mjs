@@ -13,7 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createServer } from '../tools/serve.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const chromePath = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const chromePath = process.env.CHROME_BIN || process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const TIMEOUT = Number(process.env.CDP_TIMEOUT_MS || 45000);
 const updateArtifacts = process.argv.includes('--update-artifacts');
 const tmpRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'shieldgraph-audit-'));
@@ -114,21 +114,35 @@ async function main() {
   const origin = `http://127.0.0.1:${server.address().port}`;
   const port = await freePort();
 
-  const chrome = spawn(chromePath, [
-    '--headless=new', '--mute-audio', '--no-first-run', '--no-default-browser-check',
-    `--user-data-dir=${profileDir}`, `--remote-debugging-port=${port}`,
-    '--disable-component-update', '--disable-sync', '--disable-background-networking',
-    '--disable-default-apps', '--disable-extensions', '--metrics-recording-only', '--hide-scrollbars',
-    '--force-color-profile=srgb', 'about:blank'
-  ], { stdio: ['ignore', 'ignore', 'ignore'] });
-  const exited = new Promise((resolve) => chrome.on('exit', resolve));
-  chrome.on('error', () => {});
-
+  let chrome = null;
+  let chromeDone = Promise.resolve(null);
+  let chromeStartupError = null;
+  let chromeClosed = false;
   let cdp;
   const errors = { console: [], exceptions: [], failed: [], external: [], badStatus: [] };
   try {
+    chrome = spawn(chromePath, [
+      '--headless=new', '--mute-audio', '--no-first-run', '--no-default-browser-check',
+      `--user-data-dir=${profileDir}`, `--remote-debugging-port=${port}`,
+      '--disable-component-update', '--disable-sync', '--disable-background-networking',
+      '--disable-default-apps', '--disable-extensions', '--metrics-recording-only', '--hide-scrollbars',
+      '--force-color-profile=srgb', 'about:blank'
+    ], { stdio: ['ignore', 'ignore', 'ignore'] });
+    chromeDone = new Promise((resolve) => {
+      chrome.once('error', (error) => {
+        chromeStartupError = error;
+        resolve({ error });
+      });
+      chrome.once('close', (code, signal) => {
+        chromeClosed = true;
+        resolve({ code, signal });
+      });
+    });
+
     let wsUrl = null;
     for (let i = 0; i < 150 && !wsUrl; i += 1) {
+      if (chromeStartupError) throw new Error(`Chrome failed to start: ${chromeStartupError.message}`);
+      if (chromeClosed) throw new Error('Chrome closed before exposing a page target');
       try {
         const list = await fetch(`http://127.0.0.1:${port}/json/list`).then((r) => r.json());
         wsUrl = list.find((t) => t.type === 'page')?.webSocketDebuggerUrl;
@@ -445,13 +459,25 @@ async function main() {
   } catch (error) {
     check('audit ran to completion', false, String(error && error.stack || error).slice(0, 500));
   } finally {
-    try { await cdp?.send('Browser.close'); } catch { chrome.kill('SIGTERM'); }
-    const timer = setTimeout(() => chrome.kill('SIGKILL'), 8000);
-    await exited;
-    clearTimeout(timer);
-    server.close();
-    fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
-    check('Chrome shut down and temp profile removed', !fs.existsSync(tmpRoot));
+    try {
+      if (cdp) {
+        try { await cdp.send('Browser.close'); } catch { if (chrome) chrome.kill('SIGTERM'); }
+      } else if (chrome) chrome.kill('SIGTERM');
+      if (chrome) {
+        const timer = setTimeout(() => chrome.kill('SIGKILL'), 8000);
+        await chromeDone;
+        clearTimeout(timer);
+      }
+      try { server.close(); } catch { }
+    } finally {
+      let cleanupError = null;
+      try {
+        fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+      } catch (error) {
+        cleanupError = error;
+      }
+      check('Chrome shut down and temp profile removed', !fs.existsSync(tmpRoot), cleanupError ? String(cleanupError).slice(0, 160) : '');
+    }
   }
   const passed = results.filter((r) => r.ok).length;
   console.log(`\nbrowser audit: ${passed}/${results.length} checks passed`);

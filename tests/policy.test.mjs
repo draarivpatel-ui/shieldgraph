@@ -781,7 +781,7 @@ test('run fails closed with budgetExceeded for oversized deep key-heavy and cycl
   }
 });
 
-test('prepareContext stops walking source arrays at the retention cap', () => {
+test('prepareContext reads source properties once and stops retaining sources at the cap', () => {
   let reads = 0;
   const untrusted = Array.from({ length: WORK_LIMITS.maxContextItems + 20 }, (_, i) => ({
     origin: `page ${i}`,
@@ -791,11 +791,12 @@ test('prepareContext stops walking source arrays at the retention cap', () => {
     }
   }));
   const ctx = prepareContext({ untrusted }, balanced);
-  assert.equal(reads, WORK_LIMITS.maxContextItems);
+  assert.equal(reads, WORK_LIMITS.maxContextItems + 20);
+  assert.equal(ctx.sources.length, WORK_LIMITS.maxContextItems);
   assert.ok(ctx.budgetExceeded.some((m) => m.includes('more than')));
 });
 
-test('over-cap history is rejected before untrusted sources are scanned', () => {
+test('over-cap history is rejected after one bounded snapshot read', () => {
   let reads = 0;
   const untrusted = [{
     origin: 'page',
@@ -806,7 +807,8 @@ test('over-cap history is rejected before untrusted sources are scanned', () => 
   }];
   const history = Array.from({ length: 257 }, () => ({ tool: 'read_file' }));
   const ctx = prepareContext({ history, untrusted }, balanced);
-  assert.equal(reads, 0);
+  assert.equal(reads, 1);
+  assert.equal(ctx.sources.length, 0);
   assert.ok(ctx.budgetExceeded.some((m) => m.includes('history')));
 });
 
@@ -977,6 +979,23 @@ test('compiled guard and direct evaluation both deny the separate trusted fragme
   }
 });
 
+test('compiled guard and direct evaluation deny when a later 6-gram occurrence extends past trusted cover', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const cmd = 'abcde;fghijklm';
+  const trustedCover = 'abcde;fghij';
+  const sourceText = 'abcde;fghijZ noise abcde;fghijklm';
+  const call = { tool: 'shell_exec', args: { cmd } };
+  const direct = decide(call, { trusted: [trustedCover], untrusted: [{ origin: 'page', text: sourceText }] });
+  const guard = mod.createGuard();
+  guard.addTrusted(trustedCover);
+  guard.addUntrusted(sourceText, 'page');
+  const compiled = guard.check(call);
+  for (const verdict of [direct, compiled]) {
+    assert.equal(verdict.decision, 'deny');
+    assert.ok(verdict.findings.some((f) => f.rule === 'shellMetaFromUntrusted'));
+  }
+});
+
 test('shell operator denial excerpt windows around the operator instead of truncating it away', () => {
   const cmd = `echo ${'a'.repeat(90)}; touch z`;
   const r = decide(
@@ -1022,6 +1041,86 @@ test('context validation reaches nested sources, history, quota values and extra
   }
 });
 
+test('context snapshot counts primitive elements against the work budget', () => {
+  const r = decide(
+    { tool: 'read_file', args: { path: 'src/app.ts' } },
+    { extra: Array.from({ length: WORK_LIMITS.maxContextKeys + 1 }, () => 1) }
+  );
+  assert.equal(r.decision, 'deny');
+  assert.ok(r.findings.some((f) => f.rule === 'budgetExceeded' && f.message.includes('properties or elements')));
+});
+
+test('getter-returned quotaCounts are validated from the single snapshot', () => {
+  let reads = 0;
+  const context = {};
+  Object.defineProperty(context, 'quotaCounts', {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return JSON.parse('{"__proto__":{"polluted":true}}');
+    }
+  });
+  const r = decide({ tool: 'read_file', args: { path: 'src/app.ts' } }, context);
+  assert.equal(reads, 1);
+  assert.equal(r.decision, 'deny');
+  assert.ok(r.findings.some((f) => f.rule === 'budgetExceeded' && f.message.includes('__proto__')));
+});
+
+test('functions and class instances in history metadata are rejected before branding', () => {
+  class MetadataClass {}
+  for (const [label, meta] of [
+    ['function', { callback() {} }],
+    ['class instance', { payload: new MetadataClass() }]
+  ]) {
+    const context = { history: [{ tool: 'read_file', meta }] };
+    const ctx = prepareContext(context, balanced);
+    assert.equal(ctx.history.length, 0, label);
+    assert.ok(ctx.budgetExceeded.some((m) => m.includes('unsupported function or class instance')), label);
+    const r = decide({ tool: 'read_file', args: { path: 'src/app.ts' } }, context);
+    assert.equal(r.decision, 'deny', label);
+    assert.ok(rules(r).includes('budgetExceeded'), label);
+  }
+});
+
+test('no reachable prepared context value is unfrozen', () => {
+  const ctx = prepareContext({
+    trusted: ['read src'],
+    untrusted: [{ origin: 'page', text: 'ordinary text' }],
+    history: [{ tool: 'read_file', meta: { nested: true } }],
+    quotaCounts: { read_file: 2 }
+  }, balanced);
+  const seen = new Set();
+  const stack = [ctx];
+  let inspected = 0;
+  while (stack.length) {
+    const value = stack.pop();
+    if (!value || (typeof value !== 'object' && typeof value !== 'function') || seen.has(value)) continue;
+    seen.add(value);
+    inspected += 1;
+    assert.equal(Object.isFrozen(value), true, `unfrozen value at inspection ${inspected}`);
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor && Object.hasOwn(descriptor, 'value')) stack.push(descriptor.value);
+    }
+  }
+  assert.ok(inspected > 10);
+});
+
+test('a balanced prepared context cannot bypass zero-trust source filtering', () => {
+  const zeroTrust = presetPolicy('zeroTrust');
+  const cmd = 'abcde;fghijklm';
+  const raw = { untrusted: [{ origin: 'internal file', trust: 'internal', text: cmd }] };
+  const preparedBalanced = prepareContext(raw, balanced);
+  assert.equal(preparedBalanced.sources.length, 0);
+  const call = { tool: 'shell_exec', args: { cmd } };
+  const directZeroTrust = decide(call, raw, zeroTrust);
+  assert.equal(directZeroTrust.decision, 'deny');
+  assert.ok(directZeroTrust.findings.some((f) => f.rule === 'shellMetaFromUntrusted'));
+  const mismatched = decide(call, preparedBalanced, zeroTrust);
+  assert.equal(mismatched.decision, 'deny');
+  assert.ok(mismatched.findings.some((f) => f.rule === 'budgetExceeded' && f.message.includes('different policy')));
+});
+
 test('prepareContext output is deeply frozen and quota counts are immutable', () => {
   const ctx = prepareContext({
     trusted: ['read src'],
@@ -1033,12 +1132,13 @@ test('prepareContext output is deeply frozen and quota counts are immutable', ()
   for (const value of [ctx, ctx.sources, ctx.sources[0], ctx.sources[0].injection, ctx.history, ctx.history[0], ctx.history[0].meta, ctx.quotaCounts, ctx.budgetExceeded, ctx.trustedPartsLower]) {
     assert.equal(Object.isFrozen(value), true);
   }
-  assert.equal(ctx.quotaCounts.get('read_file'), 2);
+  assert.equal(ctx.quotaCounts.read_file, 2);
+  assert.equal(typeof ctx.quotaCounts.get, 'undefined');
   assert.throws(() => { ctx.sources[0].text = 'changed'; }, TypeError);
   assert.throws(() => { ctx.history[0].meta.nested = false; }, TypeError);
-  assert.throws(() => { ctx.quotaCounts.get = () => 0; }, TypeError);
+  assert.throws(() => { ctx.quotaCounts.read_file = 0; }, TypeError);
   assert.throws(() => { ctx.budgetExceeded.push('changed'); }, TypeError);
-  assert.equal(ctx.quotaCounts.get('read_file'), 2);
+  assert.equal(ctx.quotaCounts.read_file, 2);
 });
 
 test('throwing argument getters return guardError in direct evaluation and the compiled guard', async () => {

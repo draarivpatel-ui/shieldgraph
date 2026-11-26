@@ -7,6 +7,9 @@ import { analyzePath, canonicalizePath, SENSITIVE_PATTERNS } from './pathguard.m
 import { analyzeShell } from './shell.mjs';
 import { scoreInjection } from './injection.mjs';
 
+const MAP_ENTRIES = Map.prototype.entries;
+const MAP_ITERATOR_NEXT = Object.getPrototypeOf(MAP_ENTRIES.call(new Map())).next;
+
 // Tool catalog: the effect class of every tool and how each argument is read.
 export const TOOL_CATALOG = {
   read_file: { effect: 'fs-read', privileged: false, args: { path: 'path' } },
@@ -429,109 +432,190 @@ function scanUntrustedSource(key, text) {
   return scan;
 }
 
+const PROTO_KEY_CONTEXT_MESSAGE = 'Context object contains an own __proto__ key.';
+const CONTEXT_SNAPSHOT_BUDGET_MESSAGE = `Context snapshot inspects more than ${WORK_LIMITS.maxContextKeys} properties or elements.`;
+const CONTEXT_SNAPSHOT_DEPTH_MESSAGE = 'Context snapshot is cyclic or nested too deeply.';
+const CONTEXT_UNSUPPORTED_MESSAGE = 'Context object contains an unsupported function or class instance.';
+const PREPARED_POLICY_MISMATCH_MESSAGE = 'Prepared context was created under a different policy.';
+
 function immutableQuotaCounts(counts) {
   if (!counts) return null;
-  const entries = Object.freeze([...counts.entries()].map(([tool, count]) => Object.freeze([tool, count])));
-  const tools = Object.freeze(entries.map(([tool]) => tool));
-  const values = Object.freeze(entries.map(([, count]) => count));
-  const lookup = Object.create(null);
-  for (const [tool, count] of entries) {
-    Object.defineProperty(lookup, tool, { value: count, enumerable: true, writable: false, configurable: false });
-  }
-  Object.freeze(lookup);
   const api = Object.create(null);
-  Object.defineProperties(api, {
-    size: { value: entries.length, enumerable: true, writable: false, configurable: false },
-    get: { value: (tool) => (hasOwn(lookup, tool) ? lookup[tool] : undefined), enumerable: true, writable: false, configurable: false },
-    has: { value: (tool) => hasOwn(lookup, tool), enumerable: true, writable: false, configurable: false },
-    entries: { value: () => entries[Symbol.iterator](), enumerable: true, writable: false, configurable: false },
-    keys: { value: () => tools[Symbol.iterator](), enumerable: true, writable: false, configurable: false },
-    values: { value: () => values[Symbol.iterator](), enumerable: true, writable: false, configurable: false },
-    forEach: {
-      value: (callback, thisArg) => {
-        if (typeof callback !== 'function') return;
-        for (const [tool, count] of entries) callback.call(thisArg, count, tool, api);
-      },
-      enumerable: true,
-      writable: false,
-      configurable: false
-    },
-    [Symbol.iterator]: { value: () => entries[Symbol.iterator](), enumerable: true, writable: false, configurable: false }
-  });
+  for (const tool of Object.getOwnPropertyNames(counts)) {
+    Object.defineProperty(api, tool, { value: counts[tool], enumerable: true, writable: false, configurable: false });
+  }
   return Object.freeze(api);
 }
 
 function normalizeQuotaCounts(raw, policy) {
   if (raw === undefined || raw === null) return null;
-  const entries = raw instanceof Map ? raw.entries() : (Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.entries(raw) : []));
+  const entries = [];
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 1) {
+      const entry = raw[i];
+      if (Array.isArray(entry)) entries.push([entry[0], entry[1]]);
+    }
+  } else if (raw instanceof Map) {
+    const iterator = MAP_ENTRIES.call(raw);
+    while (true) {
+      const step = MAP_ITERATOR_NEXT.call(iterator);
+      if (step.done) break;
+      entries.push([step.value[0], step.value[1]]);
+    }
+  } else if (raw && typeof raw === 'object') {
+    for (const key of Object.getOwnPropertyNames(raw)) entries.push([key, raw[key]]);
+  }
   const configuredTools = policy && policy.tools && typeof policy.tools === 'object' ? policy.tools : {};
-  const counts = new Map();
+  const totals = Object.create(null);
   for (const entry of entries) {
-    if (!Array.isArray(entry)) continue;
-    const [tool, value] = entry;
+    const tool = entry[0];
+    const value = entry[1];
     const count = Number(value);
     if (typeof tool !== 'string' || !hasOwn(configuredTools, tool) || !Number.isFinite(count) || count <= 0) continue;
-    counts.set(tool, (counts.get(tool) || 0) + Math.floor(count));
+    totals[tool] = (totals[tool] || 0) + Math.floor(count);
   }
-  return immutableQuotaCounts(counts);
+  return immutableQuotaCounts(totals);
 }
 
-function hasOwnProtoKey(value) {
-  return Boolean(value && (typeof value === 'object' || typeof value === 'function') && hasOwn(value, '__proto__'));
+function noteContextSnapshot(state, message) {
+  if (!state.errors.includes(message)) state.errors.push(message);
 }
 
-function containsOwnProtoKey(value, state = { keys: 0, active: new Set() }, depth = 0) {
-  if (!value || (typeof value !== 'object' && typeof value !== 'function')) return false;
-  if (hasOwnProtoKey(value)) return true;
-  if (depth >= 32 || state.active.has(value)) return true;
-  state.keys += 1;
-  if (state.keys > 4096) return true;
-  state.active.add(value);
+function countContextInspection(state) {
+  if (state.stop) return false;
+  state.inspected += 1;
+  if (state.inspected > WORK_LIMITS.maxContextKeys) {
+    noteContextSnapshot(state, CONTEXT_SNAPSHOT_BUDGET_MESSAGE);
+    state.stop = true;
+    return false;
+  }
+  return true;
+}
+
+function snapshotArrayValue(value, state, depth) {
+  const copy = [];
   try {
-    if (value instanceof Map) {
-      for (const [key, entry] of value) {
-        if (containsOwnProtoKey(key, state, depth + 1) || containsOwnProtoKey(entry, state, depth + 1)) return true;
+    if (countContextInspection(state)) {
+      const length = value.length;
+      for (let i = 0; i < length; i += 1) {
+        if (!countContextInspection(state)) break;
+        copy[i] = snapshotContextValue(value[i], state, depth + 1);
       }
     }
-    if (value instanceof Set) {
-      for (const entry of value) if (containsOwnProtoKey(entry, state, depth + 1)) return true;
-    }
-    for (const key of Reflect.ownKeys(value)) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor) continue;
-      if (!hasOwn(descriptor, 'value')) continue;
-      if (containsOwnProtoKey(descriptor.value, state, depth + 1)) return true;
-    }
-  } finally {
-    state.active.delete(value);
-  }
-  return false;
-}
-
-function copyContextDatum(value, active = new Set(), depth = 0) {
-  if (!value || typeof value !== 'object') return value;
-  if (depth >= 32 || active.has(value)) throw cloneBudgetFailure('Context metadata is cyclic or nested too deeply.');
-  active.add(value);
-  const copy = Array.isArray(value) ? [] : Object.create(null);
-  try {
-    for (const key of Object.keys(value)) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor || !hasOwn(descriptor, 'value')) throw cloneBudgetFailure('Context metadata uses an accessor property.');
-      Object.defineProperty(copy, key, {
-        value: copyContextDatum(descriptor.value, active, depth + 1),
+    if (countContextInspection(state) && hasOwn(value, '__proto__') && countContextInspection(state)) {
+      Object.defineProperty(copy, '__proto__', {
+        value: snapshotContextValue(value.__proto__, state, depth + 1),
         enumerable: true,
         writable: false,
         configurable: false
       });
     }
   } finally {
-    active.delete(value);
+    state.active.delete(value);
   }
   return Object.freeze(copy);
 }
 
+function snapshotMapValue(value, state, depth) {
+  const copy = [];
+  try {
+    const iterator = MAP_ENTRIES.call(value);
+    while (!state.stop) {
+      const step = MAP_ITERATOR_NEXT.call(iterator);
+      if (step.done) break;
+      if (!countContextInspection(state)) break;
+      if (!countContextInspection(state)) break;
+      if (!countContextInspection(state)) break;
+      const entry = step.value;
+      copy.push(Object.freeze([
+        snapshotContextValue(entry[0], state, depth + 1),
+        snapshotContextValue(entry[1], state, depth + 1)
+      ]));
+    }
+  } finally {
+    state.active.delete(value);
+  }
+  return Object.freeze(copy);
+}
+
+function snapshotPlainObjectValue(value, state, depth) {
+  const copy = Object.create(null);
+  try {
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (!countContextInspection(state)) break;
+      Object.defineProperty(copy, key, {
+        value: snapshotContextValue(value[key], state, depth + 1),
+        enumerable: true,
+        writable: false,
+        configurable: false
+      });
+    }
+  } finally {
+    state.active.delete(value);
+  }
+  return Object.freeze(copy);
+}
+
+function snapshotContextValue(value, state, depth) {
+  if (state.stop) return undefined;
+  if (typeof value === 'function') {
+    noteContextSnapshot(state, CONTEXT_UNSUPPORTED_MESSAGE);
+    return undefined;
+  }
+  if (!value || typeof value !== 'object') return value;
+  if (!countContextInspection(state)) return undefined;
+  if (depth >= 32 || state.active.has(value)) {
+    noteContextSnapshot(state, CONTEXT_SNAPSHOT_DEPTH_MESSAGE);
+    state.stop = true;
+    return undefined;
+  }
+  state.active.add(value);
+  let copy;
+  if (Array.isArray(value)) copy = snapshotArrayValue(value, state, depth);
+  else if (value instanceof Map) copy = snapshotMapValue(value, state, depth);
+  else {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Object.prototype || prototype === null) copy = snapshotPlainObjectValue(value, state, depth);
+    else {
+      state.active.delete(value);
+      noteContextSnapshot(state, CONTEXT_UNSUPPORTED_MESSAGE);
+      return undefined;
+    }
+  }
+  state.originals.set(copy, value);
+  return copy;
+}
+
+function snapshotContextInput(context) {
+  const state = { inspected: 0, active: new Set(), originals: new WeakMap(), errors: [], stop: false };
+  const value = snapshotContextValue(context, state, 0);
+  return { value, originals: state.originals, errors: state.errors };
+}
+
+function scanSnapshottedContext(value, state, depth = 0) {
+  if (!value || typeof value !== 'object') return;
+  if (depth >= 32 || state.active.has(value)) return;
+  state.active.add(value);
+  try {
+    if (hasOwn(value, '__proto__')) state.hasProtoKey = true;
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i += 1) scanSnapshottedContext(value[i], state, depth + 1);
+    } else {
+      for (const key of Object.getOwnPropertyNames(value)) scanSnapshottedContext(value[key], state, depth + 1);
+    }
+  } finally {
+    state.active.delete(value);
+  }
+}
+
+function validateContextSnapshot(value) {
+  const state = { hasProtoKey: false, active: new Set() };
+  scanSnapshottedContext(value, state);
+  return state;
+}
+
 function deepFreeze(value, seen = new WeakSet()) {
-  if (!value || typeof value !== 'object' || seen.has(value)) return value;
+  if (!value || (typeof value !== 'object' && typeof value !== 'function') || seen.has(value)) return value;
   seen.add(value);
   for (const key of Reflect.ownKeys(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -540,8 +624,41 @@ function deepFreeze(value, seen = new WeakSet()) {
   return Object.freeze(value);
 }
 
-const PROTO_KEY_CONTEXT_MESSAGE = 'Context object contains an own __proto__ key.';
-const PREPARED_CONTEXTS = new WeakSet();
+function stablePolicyDatum(value, active = new Set()) {
+  if (Array.isArray(value)) {
+    if (active.has(value)) throw new Error('Policy contains a cycle.');
+    active.add(value);
+    try {
+      const out = [];
+      for (let i = 0; i < value.length; i += 1) out[i] = stablePolicyDatum(value[i], active);
+      return out;
+    } finally {
+      active.delete(value);
+    }
+  }
+  if (value && typeof value === 'object') {
+    if (active.has(value)) throw new Error('Policy contains a cycle.');
+    active.add(value);
+    try {
+      const out = Object.create(null);
+      for (const key of Object.getOwnPropertyNames(value).sort()) {
+        const item = value[key];
+        if (item === undefined || typeof item === 'function') continue;
+        out[key] = stablePolicyDatum(item, active);
+      }
+      return out;
+    } finally {
+      active.delete(value);
+    }
+  }
+  return value;
+}
+
+function policyKey(policy) {
+  return JSON.stringify(stablePolicyDatum(policy));
+}
+
+const PREPARED_CONTEXTS = new WeakMap();
 
 /**
  * Prepares a context once so many calls can be checked cheaply.
@@ -553,14 +670,22 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
   const budgetExceeded = [];
   const note = (reason) => { if (!budgetExceeded.includes(reason)) budgetExceeded.push(reason); };
 
-  const rejectContext = containsOwnProtoKey(context);
-  if (rejectContext) note(PROTO_KEY_CONTEXT_MESSAGE);
-  const rawHistory = rejectContext || !Array.isArray(context.history) ? [] : context.history;
-  const retainedHistory = rawHistory.slice(-256);
+  const snapshot = snapshotContextInput(context);
+  for (const reason of snapshot.errors) note(reason);
+  const input = snapshot.value && typeof snapshot.value === 'object' ? snapshot.value : Object.create(null);
+  const validation = validateContextSnapshot(input);
+  if (validation.hasProtoKey) note(PROTO_KEY_CONTEXT_MESSAGE);
+  const rejectContext = snapshot.errors.length > 0 || validation.hasProtoKey;
+
+  const rawHistory = rejectContext || !Array.isArray(input.history) ? [] : input.history;
   const historyOverCap = rawHistory.length > 256;
   if (historyOverCap) note('Retained tool-call history exceeds 256 entries.');
-  const history = historyOverCap || rejectContext ? [] : retainedHistory.map((entry) => copyContextDatum(entry));
-  const quotaCounts = rejectContext ? null : normalizeQuotaCounts(context.quotaCounts, policy);
+  const history = [];
+  if (!historyOverCap && !rejectContext) {
+    const start = Math.max(0, rawHistory.length - 256);
+    for (let i = start; i < rawHistory.length; i += 1) history.push(rawHistory[i]);
+  }
+  const quotaCounts = rejectContext ? null : normalizeQuotaCounts(input.quotaCounts, policy);
 
   let contextItems = 0;
   let retainedChars = 0;
@@ -588,29 +713,24 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
   };
 
   const trustedParts = [];
-  for (const value of (historyOverCap || rejectContext) ? [] : (Array.isArray(context.trusted) ? context.trusted : [])) {
+  const rawTrusted = historyOverCap || rejectContext || !Array.isArray(input.trusted) ? [] : input.trusted;
+  for (let i = 0; i < rawTrusted.length; i += 1) {
     if (!takeContextItem()) break;
-    if (containsOwnProtoKey(value)) {
-      note(PROTO_KEY_CONTEXT_MESSAGE);
-      continue;
-    }
-    trustedParts.push(retain(value, 'trusted context').text);
+    trustedParts.push(retain(rawTrusted[i], 'trusted context').text);
   }
   const trustedText = trustedParts.join('\n');
 
   const sources = [];
-  const rawSources = (historyOverCap || rejectContext) ? [] : (Array.isArray(context.untrusted) ? context.untrusted : []);
-  for (const [i, input] of rawSources.entries()) {
+  const rawSources = historyOverCap || rejectContext || !Array.isArray(input.untrusted) ? [] : input.untrusted;
+  for (let i = 0; i < rawSources.length; i += 1) {
     if (!takeContextItem()) break;
-    if (containsOwnProtoKey(input)) {
-      note(PROTO_KEY_CONTEXT_MESSAGE);
-      continue;
-    }
-    const src = input && typeof input === 'object' ? input : { text: input };
+    const sourceInput = rawSources[i];
+    const src = sourceInput && typeof sourceInput === 'object' ? sourceInput : { text: sourceInput };
     const trust = src.trust === 'internal' ? 'internal' : 'untrusted';
     if (trust === 'internal' && policy.trustInternal) continue;
     const held = retain(src.text || '', 'untrusted context');
-    const scan = scanUntrustedSource(input, held.text);
+    const scanKey = sourceInput && typeof sourceInput === 'object' ? snapshot.originals.get(sourceInput) || sourceInput : sourceInput;
+    const scan = scanUntrustedSource(scanKey, held.text);
     sources.push({
       id: src.id || `source-${i + 1}`,
       origin: src.origin || 'untrusted content',
@@ -625,13 +745,10 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
 
   const secrets = [];
   const seenSecrets = new Set();
-  for (const input of (historyOverCap || rejectContext) ? [] : (Array.isArray(context.secrets) ? context.secrets : [])) {
+  const rawSecrets = historyOverCap || rejectContext || !Array.isArray(input.secrets) ? [] : input.secrets;
+  for (let i = 0; i < rawSecrets.length; i += 1) {
     if (!takeContextItem()) break;
-    if (containsOwnProtoKey(input)) {
-      note(PROTO_KEY_CONTEXT_MESSAGE);
-      continue;
-    }
-    const value = String(input);
+    const value = String(rawSecrets[i]);
     if (value.length < 8 || seenSecrets.has(value)) continue;
     seenSecrets.add(value);
     const held = retain(value, 'secret context');
@@ -649,7 +766,23 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
     budgetExceeded
   };
   deepFreeze(prepared);
-  PREPARED_CONTEXTS.add(prepared);
+  PREPARED_CONTEXTS.set(prepared, policyKey(policy));
+  return prepared;
+}
+
+function rejectedPreparedContext(policy, key) {
+  const prepared = {
+    trustedText: '',
+    trustedLower: '',
+    trustedPartsLower: [],
+    sources: [],
+    secrets: [],
+    history: [],
+    quotaCounts: null,
+    budgetExceeded: [PREPARED_POLICY_MISMATCH_MESSAGE]
+  };
+  deepFreeze(prepared);
+  PREPARED_CONTEXTS.set(prepared, key || policyKey(policy));
   return prepared;
 }
 
@@ -804,33 +937,36 @@ function shellOperatorWitness(text, haystack, trustedPartsLower) {
   const positions = new Map();
   for (let j = 0; j + MIN_OPERATOR_WITNESS <= y.length; j += 1) {
     const key = y.slice(j, j + MIN_OPERATOR_WITNESS);
-    if (!positions.has(key)) positions.set(key, j);
+    if (!positions.has(key)) positions.set(key, []);
+    positions.get(key).push(j);
   }
   for (let i = 0; i + MIN_OPERATOR_WITNESS <= x.length; i += 1) {
     const witness = x.slice(i, i + MIN_OPERATOR_WITNESS);
     const operator = witness.match(SHELL_OPERATOR_PATTERN);
     if (!operator) continue;
-    const yFirst = positions.get(witness);
-    if (yFirst === undefined) continue;
-    let start = i;
-    let end = i + MIN_OPERATOR_WITNESS;
-    let yStart = yFirst;
-    let yEnd = yFirst + MIN_OPERATOR_WITNESS;
-    while (start > 0 && yStart > 0 && x[start - 1] === y[yStart - 1]) {
-      start -= 1;
-      yStart -= 1;
+    const occurrences = positions.get(witness);
+    if (!occurrences) continue;
+    for (const yFirst of occurrences) {
+      let start = i;
+      let end = i + MIN_OPERATOR_WITNESS;
+      let yStart = yFirst;
+      let yEnd = yFirst + MIN_OPERATOR_WITNESS;
+      while (start > 0 && yStart > 0 && x[start - 1] === y[yStart - 1]) {
+        start -= 1;
+        yStart -= 1;
+      }
+      while (end < x.length && yEnd < y.length && x[end] === y[yEnd]) {
+        end += 1;
+        yEnd += 1;
+      }
+      const run = x.slice(start, end);
+      if ((Array.isArray(trustedPartsLower) ? trustedPartsLower : []).some((part) => part.includes(run))) continue;
+      return {
+        text: run,
+        operatorIndex: i - start + operator.index,
+        operatorLength: operator[0].length
+      };
     }
-    while (end < x.length && yEnd < y.length && x[end] === y[yEnd]) {
-      end += 1;
-      yEnd += 1;
-    }
-    const run = x.slice(start, end);
-    if ((Array.isArray(trustedPartsLower) ? trustedPartsLower : []).some((part) => part.includes(run))) continue;
-    return {
-      text: run,
-      operatorIndex: i - start + operator.index,
-      operatorLength: operator[0].length
-    };
   }
   return null;
 }
@@ -996,7 +1132,13 @@ function budgetFindings(work) {
 }
 
 function evaluateCallUnsafe(call, rawContext, policy) {
-  const ctx = rawContext && PREPARED_CONTEXTS.has(rawContext) ? rawContext : prepareContext(rawContext || {}, policy);
+  const key = policyKey(policy);
+  let ctx = null;
+  if (rawContext && (typeof rawContext === 'object' || typeof rawContext === 'function')) {
+    const preparedKey = PREPARED_CONTEXTS.get(rawContext);
+    if (preparedKey !== undefined) ctx = preparedKey === key ? rawContext : rejectedPreparedContext(policy, key);
+  }
+  if (!ctx) ctx = prepareContext(rawContext || {}, policy);
   const work = createWorkBudget();
   for (const reason of ctx.budgetExceeded || []) exceedBudget(work, reason);
   const tool = call && typeof call.tool === 'string' ? call.tool : '';
@@ -1051,8 +1193,8 @@ function evaluateCallUnsafe(call, rawContext, policy) {
     return finalize(findings, policy, toolPolicy.action, {}, {});
   }
 
-  const priorCalls = ctx.quotaCounts && typeof ctx.quotaCounts.get === 'function'
-    ? (ctx.quotaCounts.get(tool) || 0)
+  const priorCalls = ctx.quotaCounts
+    ? (hasOwn(ctx.quotaCounts, tool) ? ctx.quotaCounts[tool] : 0)
     : ctx.history.filter((h) => h && h.tool === tool).length;
   if (priorCalls >= toolPolicy.maxCalls) findings.push({ rule: 'rateLimit', severity: 'high', message: `${tool} already ran ${priorCalls} times (cap ${toolPolicy.maxCalls}).` });
 

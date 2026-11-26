@@ -23,7 +23,7 @@ Node.js 22 or newer is required for the tests, guard build and generated middlew
 - **Shell analysis.** A small POSIX lexer splits commands the way `sh` would, honoring quotes, then flags pipe-to-interpreter, reverse shells, destructive commands, network tools, permission changes, symlink planting and decode-and-run chains. Wrappers do not hide a payload, because `sh -c` scripts and `$( )`, backtick and `<( )` substitutions are re-analyzed up to three levels deep, and every argument is checked as a path (so `head .env` is caught like `cat .env`). Shell operators that arrived inside untrusted text are treated as command injection.
 - **Prompt-injection scoring.** Ten signal families (authority override, fake role markers, delimiter breakout, agent-addressed orders, secrecy requests, tool directives, exfiltration verbs, urgency, hidden carriers, markdown beacon templates) run on the decoded text and combine like independent probabilities.
 - **Confused-deputy checks.** Email recipients and payment accounts must have been named by the user. A wire to an account that appears only in an inbound email is blocked.
-- **Policy compiler.** Policies are JSON manifests with a per-tool action, argument length cap and call cap, plus an action for each of 41 rules. Validation rejects unknown keys, and any rule left out defaults to deny. Exports are the runnable guard, the policy JSON and a one-page printable audit sheet.
+- **Policy compiler.** Policies are JSON manifests with a per-tool action, argument length cap and call cap, plus actions for 41 rules. 37 rule actions are user-configurable, while 4 core safety rules stay locked to deny. Validation rejects unknown keys, and any rule left out defaults to deny. Exports are the runnable guard, the policy JSON and a one-page printable audit sheet.
 
 ## Benchmark
 
@@ -66,7 +66,7 @@ const out = await guard.run({ tool: 'shell_exec', args: { cmd } }, (args, frozen
 
 Tool results feed back into the context. Files read with `read_file` count as internal content, which the Balanced preset trusts, so pass third-party files (a cloned repo's README, a downloaded PDF) through `guard.addUntrusted` yourself.
 
-The guard file is built by concatenating the exact detector modules the workbench runs. Automated regression tests verify the two for parity by importing the compiled guard for every preset and checking that it returns the same decision, risk and rule list as the engine for all 29 calls. Execution tests prove that allowed calls reach a mock executor, denied or rejected calls never do, held calls wait for the approval callback, and concurrent calls reserve per-tool quota before yielding.
+The guard file is built by concatenating the exact detector modules the workbench runs. Automated regression tests verify the two for parity by importing the compiled guard for every preset and checking that it returns the same decision, risk and rule list as the engine for all 29 benchmark tool calls across the three presets. Execution tests prove that allowed calls reach a mock executor, denied or rejected calls never do, held calls wait for the approval callback, and concurrent calls reserve per-tool quota before yielding.
 
 ## Scope and limits
 
@@ -81,7 +81,7 @@ ShieldGraph is deterministic static and taint analysis of recorded traces. It is
 ## Tests
 
 ```sh
-npm test         # 324 Node unit tests (engine, policy and guard parity, craft)
+npm test         # 331 Node unit tests (engine, policy and guard parity, craft)
 npm run audit    # headless Chrome audit at 1440x900, 820x1180 and 390x844
 ```
 

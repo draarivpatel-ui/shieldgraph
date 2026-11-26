@@ -15,6 +15,7 @@ export const WORK_LIMITS = Object.freeze({
   maxCollectedStrings: 256,
   maxCollectDepth: 10,
   maxContextItems: 48,
+  maxContextKeys: 4096,
   maxContextChars: 131072,
   maxSourceChars: 32768,
   maxPairwiseComparisons: 24,
