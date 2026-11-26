@@ -587,3 +587,234 @@ test('concurrent runs reserve per-tool quota before yielding', async () => {
     assert.ok(r.reason.verdict.findings.some((f) => f.rule === 'rateLimit'));
   }
 });
+
+async function rejectionOf(promise) {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  return null;
+}
+
+// ---------- regressions: final security review ----------
+test('run enforcement is immune to a mutating onDecision callback', async () => {
+  const { mod } = await loadCompiled('balanced');
+  let callbackVerdict = null;
+  let approvalVerdict = null;
+  let runs = 0;
+  const guard = mod.createGuard({
+    onDecision(call, verdict) {
+      callbackVerdict = verdict;
+      for (const mutate of [
+        () => { verdict.decision = 'deny'; },
+        () => { verdict.findings.length = 0; },
+        () => { verdict.findings[0].action = 'deny'; },
+        () => { verdict.provenance.injected = {}; }
+      ]) {
+        try { mutate(); } catch { /* a frozen verdict refuses the write */ }
+      }
+    },
+    approve: async (call, verdict) => {
+      approvalVerdict = verdict;
+      return true;
+    }
+  });
+  const result = await guard.run({ tool: 'http_post', args: { url: 'https://new.example/n', body: 'safe body' } }, () => { runs += 1; return 'ok'; });
+  assert.equal(result, 'ok');
+  assert.equal(runs, 1);
+  assert.equal(callbackVerdict, approvalVerdict);
+  assert.equal(approvalVerdict.decision, 'require_approval');
+  assert.equal(Object.isFrozen(approvalVerdict), true);
+  assert.equal(Object.isFrozen(approvalVerdict.findings), true);
+  assert.equal(Object.isFrozen(approvalVerdict.findings[0]), true);
+  assert.equal(Object.isFrozen(approvalVerdict.provenance), true);
+});
+
+test('a throwing onDecision releases the reserved quota slot', async () => {
+  const raw = clonePolicy(PRESETS.balanced);
+  raw.tools.read_file.maxCalls = 2;
+  raw.rules.rateLimit = 'deny';
+  const policy = validatePolicy(raw).policy;
+  const { mod } = await loadCompiledPolicy(policy, 'quota-decision-throw');
+  const boom = new Error('decision boom');
+  let callbacks = 0;
+  const guard = mod.createGuard({
+    onDecision() {
+      callbacks += 1;
+      if (callbacks === 1) throw boom;
+    }
+  });
+  const call = { tool: 'read_file', args: { path: 'src/app.ts' } };
+  const first = await rejectionOf(guard.run(call, () => { throw new Error('must not execute'); }));
+  assert.equal(first, boom);
+  assert.equal(await guard.run(call, () => 'ok'), 'ok');
+  assert.equal(guard.quotaCounts.get('read_file'), 2);
+});
+
+test('a throwing approver releases the reserved quota slot', async () => {
+  const raw = clonePolicy(PRESETS.zeroTrust);
+  raw.tools.shell_exec.maxCalls = 2;
+  const policy = validatePolicy(raw).policy;
+  const { mod } = await loadCompiledPolicy(policy, 'quota-approve-throw');
+  const boom = new Error('approval boom');
+  let approvals = 0;
+  const guard = mod.createGuard({
+    approve: async () => {
+      approvals += 1;
+      if (approvals === 1) throw boom;
+      return true;
+    }
+  });
+  const call = { tool: 'shell_exec', args: { cmd: 'ls' } };
+  const first = await rejectionOf(guard.run(call, () => { throw new Error('must not execute'); }));
+  assert.equal(first, boom);
+  assert.equal(await guard.run(call, () => 'ok'), 'ok');
+  assert.equal(approvals, 2);
+  assert.equal(guard.quotaCounts.get('shell_exec'), 2);
+});
+
+test('run preserves an own __proto__ argument key and rejects it like direct evaluation', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const args = JSON.parse('{"__proto__":{"polluted":true}}');
+  const direct = decide({ tool: 'read_file', args });
+  assert.equal(direct.decision, 'deny');
+  assert.ok(rules(direct).includes('badArgs'));
+  let snapshot = null;
+  const guard = mod.createGuard({ onDecision(call) { snapshot = call; } });
+  let runs = 0;
+  const blocked = await rejectionOf(guard.run({ tool: 'read_file', args }, () => { runs += 1; }));
+  assert.equal(runs, 0);
+  assert.equal(blocked.name, 'ShieldGraphBlocked');
+  assert.deepEqual(blocked.verdict.findings.map((f) => f.rule), direct.findings.map((f) => f.rule));
+  assert.equal(Object.hasOwn(snapshot.args, '__proto__'), true);
+  assert.equal(snapshot.args.__proto__.polluted, true);
+  assert.equal(Object.getPrototypeOf(snapshot.args), null);
+  assert.equal(Object.isFrozen(snapshot.args.__proto__), true);
+});
+
+test('dedicated quota survives 300 denied calls that trim bounded history', async () => {
+  const raw = clonePolicy(PRESETS.balanced);
+  raw.tools.read_file.maxCalls = 1;
+  raw.rules.rateLimit = 'deny';
+  const policy = validatePolicy(raw).policy;
+  const { mod } = await loadCompiledPolicy(policy, 'quota-trimmed-history');
+  const guard = mod.createGuard();
+  assert.equal(await guard.run({ tool: 'read_file', args: { path: 'src/app.ts' } }, () => 'ok'), 'ok');
+  for (let i = 0; i < 300; i += 1) {
+    const blocked = await rejectionOf(guard.run({ tool: 'http_get', args: { url: 'http://169.254.169.254/latest' } }, () => { throw new Error('must not execute'); }));
+    assert.equal(blocked.name, 'ShieldGraphBlocked');
+  }
+  assert.equal(guard.context.history.length, 256);
+  assert.equal(guard.context.history.some((h) => h.tool === 'read_file'), false);
+  const blocked = await rejectionOf(guard.run({ tool: 'read_file', args: { path: 'src/app.ts' } }, () => 'must not execute'));
+  assert.equal(blocked.name, 'ShieldGraphBlocked');
+  assert.ok(blocked.verdict.findings.some((f) => f.rule === 'rateLimit'));
+});
+
+test('shipped Balanced and Zero-Trust policies stop execution over their tool caps', async () => {
+  const balancedGuard = (await loadCompiled('balanced')).mod.createGuard();
+  balancedGuard.addTrusted('pay 4402-118-7731');
+  let financeRuns = 0;
+  const payment = { tool: 'transfer_funds', args: { to_account: '4402-118-7731', amount: 1 } };
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal(await balancedGuard.run(payment, () => { financeRuns += 1; return 'ok'; }), 'ok');
+  }
+  const overPayment = await rejectionOf(balancedGuard.run(payment, () => { financeRuns += 1; }));
+  assert.equal(overPayment.name, 'ShieldGraphBlocked');
+  assert.equal(overPayment.verdict.decision, 'require_approval');
+  assert.ok(overPayment.verdict.findings.some((f) => f.rule === 'rateLimit'));
+  assert.equal(financeRuns, 3);
+
+  const zeroGuard = (await loadCompiled('zeroTrust')).mod.createGuard({ approve: async () => true });
+  let shellRuns = 0;
+  const shell = { tool: 'shell_exec', args: { cmd: 'ls' } };
+  for (let i = 0; i < 10; i += 1) {
+    assert.equal(await zeroGuard.run(shell, () => { shellRuns += 1; return 'ok'; }), 'ok');
+  }
+  const overShell = await rejectionOf(zeroGuard.run(shell, () => { shellRuns += 1; }));
+  assert.equal(overShell.name, 'ShieldGraphBlocked');
+  assert.equal(overShell.verdict.decision, 'deny');
+  assert.ok(overShell.verdict.findings.some((f) => f.rule === 'rateLimit'));
+  assert.equal(shellRuns, 10);
+});
+
+test('pending approvals consume per-tool quota before yielding', async () => {
+  const { mod } = await loadCompiled('zeroTrust');
+  const approvals = [];
+  const guard = mod.createGuard({
+    approve: () => new Promise((resolve) => approvals.push(resolve))
+  });
+  const call = { tool: 'shell_exec', args: { cmd: 'ls' } };
+  const runs = Array.from({ length: 11 }, () => guard.run(call, () => 'ok'));
+  assert.equal(approvals.length, 10);
+  for (const resolve of approvals) resolve(true);
+  const settled = await Promise.allSettled(runs);
+  assert.equal(settled.filter((r) => r.status === 'fulfilled').length, 10);
+  const rejected = settled.filter((r) => r.status === 'rejected');
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason.name, 'ShieldGraphBlocked');
+  assert.ok(rejected[0].reason.verdict.findings.some((f) => f.rule === 'rateLimit'));
+});
+
+test('run fails closed with budgetExceeded for oversized deep key-heavy and cyclic input', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const oversized = { tool: 'shell_exec', args: { cmd: `echo ${'x'.repeat(WORK_LIMITS.maxArgumentChars + 1)}` } };
+  const byteHeavy = { tool: 'shell_exec', args: { cmd: `echo ${String.fromCodePoint(0x4e2d).repeat(12000)}` } };
+  let deepValue = { end: true };
+  for (let i = 0; i < 14; i += 1) deepValue = { next: deepValue };
+  const deep = { tool: 'read_file', args: { path: 'src/app.ts', extra: deepValue } };
+  const keyArgs = { path: 'src/app.ts' };
+  for (let i = 0; i < 300; i += 1) keyArgs[`k${i}`] = 'x';
+  const keyHeavy = { tool: 'read_file', args: keyArgs };
+  const cyclicArgs = { path: 'src/app.ts' };
+  cyclicArgs.self = cyclicArgs;
+  const cyclic = { tool: 'read_file', args: cyclicArgs };
+  for (const [label, input] of [['oversized', oversized], ['byte-heavy', byteHeavy], ['deep', deep], ['key-heavy', keyHeavy], ['cyclic', cyclic]]) {
+    const guard = mod.createGuard();
+    let runs = 0;
+    const blocked = await rejectionOf(guard.run(input, () => { runs += 1; }));
+    assert.equal(blocked.name, 'ShieldGraphBlocked', label);
+    assert.equal(blocked.verdict.decision, 'deny', label);
+    assert.ok(blocked.verdict.findings.some((f) => f.rule === 'budgetExceeded'), label);
+    assert.equal(runs, 0, label);
+  }
+});
+
+test('prepareContext stops walking source arrays at the retention cap', () => {
+  let reads = 0;
+  const untrusted = Array.from({ length: WORK_LIMITS.maxContextItems + 20 }, (_, i) => ({
+    origin: `page ${i}`,
+    get text() {
+      reads += 1;
+      return `ordinary page text ${i}`;
+    }
+  }));
+  const ctx = prepareContext({ untrusted }, balanced);
+  assert.equal(reads, WORK_LIMITS.maxContextItems);
+  assert.ok(ctx.budgetExceeded.some((m) => m.includes('more than')));
+});
+
+test('over-cap history is rejected before untrusted sources are scanned', () => {
+  let reads = 0;
+  const untrusted = [{
+    origin: 'page',
+    get text() {
+      reads += 1;
+      return 'ordinary page text';
+    }
+  }];
+  const history = Array.from({ length: 257 }, () => ({ tool: 'read_file' }));
+  const ctx = prepareContext({ history, untrusted }, balanced);
+  assert.equal(reads, 0);
+  assert.ok(ctx.budgetExceeded.some((m) => m.includes('history')));
+});
+
+test('shell operator taint uses the deterministic earliest equal-length match', () => {
+  const r = decide(
+    { tool: 'shell_exec', args: { cmd: 'do abcdef;zzzzz' } },
+    { untrusted: [{ origin: 'page', text: 'x;zzzzz|abcdef' }] }
+  );
+  assert.equal(r.decision, 'allow');
+  assert.ok(!rules(r).includes('shellMetaFromUntrusted'));
+});

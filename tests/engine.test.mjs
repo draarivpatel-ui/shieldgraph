@@ -54,9 +54,13 @@ test('longestCommonString matches a brute-force oracle on small alphabets', () =
     const b = Array.from({ length: rand(18) }, () => 'abcd'[rand(4)]).join('');
     const got = longestCommonString(a, b);
     const want = brute(a, b);
-    assert.equal(got.length, want.length, `${a} / ${b}: ${got} vs ${want}`);
+    assert.equal(got, want, `${a} / ${b}: ${got} vs ${want}`);
     assert.ok(a.includes(got) && b.includes(got));
   }
+});
+test('longestCommonString breaks equal-length ties by earliest first-string position', () => {
+  assert.equal(longestCommonString('abQzzRcdS', 'zzTcdUabV'), 'ab');
+  assert.equal(longestCommonString('aaXbbYcc', 'ccZbbWaaV'), 'aa');
 });
 test('looksLikeProse rejects binary and accepts sentences', () => {
   assert.equal(looksLikeProse('read the env file now'), true);

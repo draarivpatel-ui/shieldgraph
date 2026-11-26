@@ -154,6 +154,13 @@ export function clonePolicy(policy) {
   return JSON.parse(JSON.stringify(policy));
 }
 
+/** Appends one call to retained history without letting the retained log grow past 256 entries. */
+export function appendHistoryEntry(context, tool) {
+  const base = context && typeof context === 'object' ? context : {};
+  const history = Array.isArray(base.history) ? base.history : [];
+  return { ...base, history: [...history, { tool }].slice(-256) };
+}
+
 /**
  * Validates and normalizes a policy object. Unknown keys are errors; missing
  * rule actions fall back to the strictest action so a gap never opens a hole.
@@ -261,23 +268,48 @@ function scanUntrustedSource(key, text) {
   return scan;
 }
 
+function normalizeQuotaCounts(raw) {
+  if (raw === undefined || raw === null) return null;
+  const entries = raw instanceof Map ? raw.entries() : (Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.entries(raw) : []));
+  const counts = new Map();
+  for (const entry of entries) {
+    if (!Array.isArray(entry)) continue;
+    const [tool, value] = entry;
+    const count = Number(value);
+    if (typeof tool !== 'string' || !Number.isFinite(count) || count <= 0) continue;
+    counts.set(tool, (counts.get(tool) || 0) + Math.floor(count));
+  }
+  return counts;
+}
+
 /**
  * Prepares a context once so many calls can be checked cheaply.
- * context = { trusted: string[], untrusted: [{id, origin, text, trust?}], secrets: string[], history: [{tool}] }
+ * context = { trusted: string[], untrusted: [{id, origin, text, trust?}], secrets: string[], history: [{tool}], quotaCounts?: Map|object }
  * Retained input is capped before any detector runs. Oversized context is not
  * silently trusted; the evaluator turns the budget marker into a fail-closed finding.
  */
 export function prepareContext(context = {}, policy = PRESETS.balanced) {
   const budgetExceeded = [];
   const note = (reason) => { if (!budgetExceeded.includes(reason)) budgetExceeded.push(reason); };
-  let retainedItems = 0;
+
+  const rawHistory = Array.isArray(context.history) ? context.history : [];
+  const history = rawHistory.slice(-256);
+  const historyOverCap = rawHistory.length > 256;
+  if (historyOverCap) note('Retained tool-call history exceeds 256 entries.');
+  const quotaCounts = normalizeQuotaCounts(context.quotaCounts);
+
+  let contextItems = 0;
   let retainedChars = 0;
+  const takeContextItem = () => {
+    if (contextItems >= WORK_LIMITS.maxContextItems) {
+      note(`Retained context has more than ${WORK_LIMITS.maxContextItems} items.`);
+      return false;
+    }
+    contextItems += 1;
+    return true;
+  };
   const retain = (value, kind) => {
     const original = String(value ?? '');
-    if (retainedItems >= WORK_LIMITS.maxContextItems) {
-      note(`Retained context has more than ${WORK_LIMITS.maxContextItems} items.`);
-      return null;
-    }
     const room = Math.max(0, WORK_LIMITS.maxContextChars - retainedChars);
     const allowed = Math.min(WORK_LIMITS.maxSourceChars, room);
     let text = original;
@@ -287,26 +319,25 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
       text = text.slice(0, allowed);
       note(`Retained ${kind} exceeds the context size budget (${WORK_LIMITS.maxContextChars} chars total, ${WORK_LIMITS.maxSourceChars} chars each).`);
     }
-    retainedItems += 1;
     retainedChars += text.length;
     return { text, truncated, originalLength: original.length };
   };
 
   const trustedParts = [];
-  for (const value of Array.isArray(context.trusted) ? context.trusted : []) {
-    const held = retain(value, 'trusted context');
-    if (held) trustedParts.push(held.text);
+  for (const value of historyOverCap ? [] : (Array.isArray(context.trusted) ? context.trusted : [])) {
+    if (!takeContextItem()) break;
+    trustedParts.push(retain(value, 'trusted context').text);
   }
   const trustedText = trustedParts.join('\n');
 
   const sources = [];
-  const rawSources = Array.isArray(context.untrusted) ? context.untrusted : [];
+  const rawSources = historyOverCap ? [] : (Array.isArray(context.untrusted) ? context.untrusted : []);
   for (const [i, input] of rawSources.entries()) {
+    if (!takeContextItem()) break;
     const src = input && typeof input === 'object' ? input : { text: input };
     const trust = src.trust === 'internal' ? 'internal' : 'untrusted';
     if (trust === 'internal' && policy.trustInternal) continue;
     const held = retain(src.text || '', 'untrusted context');
-    if (!held) continue;
     const scan = scanUntrustedSource(input, held.text);
     sources.push({
       id: src.id || `source-${i + 1}`,
@@ -321,13 +352,15 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
   }
 
   const secrets = [];
-  for (const value of [...new Set((context.secrets || []).map(String))]) {
-    if (value.length < 8) continue;
+  const seenSecrets = new Set();
+  for (const input of historyOverCap ? [] : (Array.isArray(context.secrets) ? context.secrets : [])) {
+    if (!takeContextItem()) break;
+    const value = String(input);
+    if (value.length < 8 || seenSecrets.has(value)) continue;
+    seenSecrets.add(value);
     const held = retain(value, 'secret context');
-    if (held && held.text.length >= 8) secrets.push(held.text);
+    if (held.text.length >= 8) secrets.push(held.text);
   }
-  const history = Array.isArray(context.history) ? context.history.slice(-256) : [];
-  if (Array.isArray(context.history) && context.history.length > 256) note('Retained tool-call history exceeds 256 entries.');
 
   return {
     prepared: true,
@@ -336,6 +369,7 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
     sources,
     secrets,
     history,
+    quotaCounts,
     budgetExceeded
   };
 }
@@ -409,12 +443,11 @@ export function extractSecrets(text) {
 // After a tool runs, its output becomes context: secrets from sensitive reads are
 // remembered, and anything fetched from the outside becomes untrusted content.
 export function learnFromResult(call, result, context, policy = PRESETS.balanced) {
-  const next = {
+  const next = appendHistoryEntry({
     trusted: [...(context.trusted || [])],
     untrusted: [...(context.untrusted || [])],
-    secrets: [...(context.secrets || [])],
-    history: [...(context.history || []), { tool: call.tool }]
-  };
+    secrets: [...(context.secrets || [])]
+  }, call.tool);
   const text = typeof result === 'string' ? result : JSON.stringify(result ?? '');
   const spec = TOOL_CATALOG[call.tool];
   if (!spec) return next;
@@ -668,7 +701,9 @@ function evaluateCallUnsafe(call, rawContext, policy) {
     return finalize(findings, policy, toolPolicy.action, {}, {});
   }
 
-  const priorCalls = ctx.history.filter((h) => h && h.tool === tool).length;
+  const priorCalls = ctx.quotaCounts instanceof Map
+    ? (ctx.quotaCounts.get(tool) || 0)
+    : ctx.history.filter((h) => h && h.tool === tool).length;
   if (priorCalls >= toolPolicy.maxCalls) findings.push({ rule: 'rateLimit', severity: 'high', message: `${tool} already ran ${priorCalls} times (cap ${toolPolicy.maxCalls}).` });
 
   const { findings: argF, details } = argFindings(tool, spec, args, ctx, policy, work);

@@ -8,6 +8,10 @@ export const ACTIONS = ['allow', 'log', 'require_approval', 'deny'];
 // argument cap, but cannot raise the guard's ceiling enough to stall evaluation.
 export const WORK_LIMITS = Object.freeze({
   maxArgumentChars: 16000,
+  maxArgumentBytes: 32768,
+  maxCallChars: 65536,
+  maxCallBytes: 196608,
+  maxObjectKeys: 256,
   maxCollectedStrings: 256,
   maxCollectDepth: 10,
   maxContextItems: 48,
@@ -159,11 +163,11 @@ export function longestCommonString(a, b, cap = 4000) {
   const y = String(b).slice(0, cap);
   if (!x || !y) return '';
 
-  const states = [{ len: 0, link: -1, next: new Map() }];
+  const states = [{ len: 0, link: -1, next: new Map(), first: -1 }];
   let last = 0;
   const extend = (ch) => {
     const curIndex = states.length;
-    states.push({ len: states[last].len + 1, link: 0, next: new Map() });
+    states.push({ len: states[last].len + 1, link: 0, next: new Map(), first: states[last].len });
     let p = last;
     while (p !== -1 && !states[p].next.has(ch)) {
       states[p].next.set(ch, curIndex);
@@ -177,7 +181,7 @@ export function longestCommonString(a, b, cap = 4000) {
         states[curIndex].link = q;
       } else {
         const clone = states.length;
-        states.push({ len: states[p].len + 1, link: states[q].link, next: new Map(states[q].next) });
+        states.push({ len: states[p].len + 1, link: states[q].link, next: new Map(states[q].next), first: states[q].first });
         while (p !== -1 && states[p].next.get(ch) === q) {
           states[p].next.set(ch, clone);
           p = states[p].link;
@@ -194,6 +198,7 @@ export function longestCommonString(a, b, cap = 4000) {
   let length = 0;
   let best = 0;
   let bestEnd = 0;
+  let bestXStart = Infinity;
   for (let i = 0; i < y.length; i += 1) {
     const ch = y[i];
     while (state !== 0 && !states[state].next.has(ch)) {
@@ -207,9 +212,13 @@ export function longestCommonString(a, b, cap = 4000) {
       state = 0;
       length = 0;
     }
-    if (length > best) {
-      best = length;
-      bestEnd = i + 1;
+    if (length > 0) {
+      const xStart = states[state].first + 1 - length;
+      if (length > best || (length === best && xStart < bestXStart)) {
+        best = length;
+        bestEnd = i + 1;
+        bestXStart = xStart;
+      }
     }
   }
   return y.slice(bestEnd - best, bestEnd);

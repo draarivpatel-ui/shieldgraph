@@ -91,6 +91,11 @@ test('UI code never writes markup from strings', () => {
     assert.doesNotMatch(read(file), /\.innerHTML|\.outerHTML|insertAdjacentHTML|document\.write/, file);
   }
 });
+test('text trace never calls an unmatched argument trusted', () => {
+  const app = read('js/app.mjs');
+  assert.ok(app.includes('no untrusted source match (origin not established)'));
+  assert.ok(!app.includes('trusted user or planner input'));
+});
 test('UI code never sets a style attribute (blocked by the CSP)', () => {
   for (const file of ['js/app.mjs', 'js/graph.mjs', 'js/report.mjs']) {
     assert.doesNotMatch(read(file), /setAttribute\(\s*'style'|\bstyle:\s*`/, file);

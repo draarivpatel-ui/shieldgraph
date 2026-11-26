@@ -1,6 +1,6 @@
 // Trace engine: replays an agent trace step by step through the policy,
 // tracks taint provenance, and builds the flow graph plus benchmark metrics.
-import { PRESETS, PRESET_ORDER, TOOL_CATALOG, EFFECT_LABELS, validatePolicy, clonePolicy, prepareContext, evaluateCall, learnFromResult } from './policy.mjs';
+import { PRESETS, PRESET_ORDER, TOOL_CATALOG, EFFECT_LABELS, validatePolicy, clonePolicy, prepareContext, evaluateCall, learnFromResult, appendHistoryEntry } from './policy.mjs';
 import { scoreInjection } from './injection.mjs';
 import { deobfuscate } from './deobfuscate.mjs';
 import { actionRank } from './util.mjs';
@@ -62,7 +62,7 @@ export function analyzeScenario(scenario, policy) {
       if (EXECUTED.has(res.decision) && node.result !== undefined) {
         context = learnFromResult({ tool: node.tool, args: node.args }, node.result, context, policy);
       } else {
-        context = { ...context, history: [...context.history, { tool: node.tool }] };
+        context = appendHistoryEntry(context, node.tool);
       }
     }
     nodes.push(out);

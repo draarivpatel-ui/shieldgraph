@@ -281,7 +281,7 @@ function renderTextTrace(run, target) {
     const outcome = `${effect} ${node.decision === 'allow' || node.decision === 'log' ? 'reached' : 'not reached'} (${STATUS_TEXT[node.decision]})`;
     const args = Object.entries(node.args || {}).map(([arg, value]) => {
       const trace = node.provenance && node.provenance[arg];
-      let source = 'trusted user or planner input';
+      let source = 'no untrusted source match (origin not established)';
       if (trace && trace.sources.length) {
         const seen = trace.sources.map((s) => `${s.origin} (${s.how})`).join(' or ');
         source = trace.endorsed ? `user-endorsed value also seen in ${seen}` : seen;
