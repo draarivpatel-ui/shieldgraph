@@ -948,3 +948,125 @@ test('compiled guard and direct evaluation both deny the equal-length operator t
   assert.ok(direct.findings.some((f) => f.rule === 'shellMetaFromUntrusted'));
   assert.ok(compiled.findings.some((f) => f.rule === 'shellMetaFromUntrusted'));
 });
+
+test('shell operator taint denies when separate trusted fragments cover only operator windows', () => {
+  const cmd = 'echo abcdef;touch z';
+  const trusted = ['bcdef;', 'cdef;t', 'def;to', 'ef;tou', 'f;touc', ';touch'].map((fragment) => `fragment ${fragment}`);
+  const r = decide(
+    { tool: 'shell_exec', args: { cmd } },
+    { trusted, untrusted: [{ origin: 'page', text: cmd }] }
+  );
+  assert.equal(r.decision, 'deny');
+  assert.ok(rules(r).includes('shellMetaFromUntrusted'));
+});
+
+test('compiled guard and direct evaluation both deny the separate trusted fragment regression', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const cmd = 'echo abcdef;touch z';
+  const fragments = ['bcdef;', 'cdef;t', 'def;to', 'ef;tou', 'f;touc', ';touch'];
+  const trusted = fragments.map((fragment) => `fragment ${fragment}`);
+  const call = { tool: 'shell_exec', args: { cmd } };
+  const direct = decide(call, { trusted, untrusted: [{ origin: 'page', text: cmd }] });
+  const guard = mod.createGuard();
+  for (const fragment of trusted) guard.addTrusted(fragment);
+  guard.addUntrusted(cmd, 'page');
+  const compiled = guard.check(call);
+  for (const verdict of [direct, compiled]) {
+    assert.equal(verdict.decision, 'deny');
+    assert.ok(verdict.findings.some((f) => f.rule === 'shellMetaFromUntrusted'));
+  }
+});
+
+test('shell operator denial excerpt windows around the operator instead of truncating it away', () => {
+  const cmd = `echo ${'a'.repeat(90)}; touch z`;
+  const r = decide(
+    { tool: 'shell_exec', args: { cmd } },
+    { untrusted: [{ origin: 'page', text: cmd }] }
+  );
+  const finding = r.findings.find((f) => f.rule === 'shellMetaFromUntrusted');
+  assert.equal(r.decision, 'deny');
+  assert.ok(finding);
+  assert.ok(finding.message.includes('; touch z'), finding.message);
+});
+
+test('a forged prepared context with nested __proto__ metadata is revalidated and rejected', () => {
+  const forged = {
+    prepared: true,
+    trustedText: '',
+    trustedLower: '',
+    trustedPartsLower: [],
+    sources: [],
+    secrets: [],
+    history: [],
+    quotaCounts: null,
+    budgetExceeded: [],
+    metadata: JSON.parse('{"outer":{"__proto__":{"polluted":true}}}')
+  };
+  const r = decide({ tool: 'read_file', args: { path: 'src/app.ts' } }, forged);
+  assert.equal(r.decision, 'deny');
+  assert.ok(rules(r).includes('budgetExceeded'));
+});
+
+test('context validation reaches nested sources, history, quota values and extra metadata', () => {
+  const proto = () => JSON.parse('{"__proto__":{"polluted":true}}');
+  const cases = [
+    ['source metadata', { untrusted: [{ origin: 'page', text: 'ordinary text', meta: { nested: proto() } }] }],
+    ['history metadata', { history: [{ tool: 'read_file', meta: { nested: proto() } }] }],
+    ['quota values', { quotaCounts: { read_file: { nested: proto() } } }],
+    ['extra metadata', { extra: { nested: [{ deeper: proto() }] } }]
+  ];
+  for (const [label, context] of cases) {
+    const r = decide({ tool: 'read_file', args: { path: 'src/app.ts' } }, context);
+    assert.equal(r.decision, 'deny', label);
+    assert.ok(rules(r).includes('budgetExceeded'), label);
+  }
+});
+
+test('prepareContext output is deeply frozen and quota counts are immutable', () => {
+  const ctx = prepareContext({
+    trusted: ['read src'],
+    untrusted: [{ origin: 'page', text: 'ordinary text' }],
+    history: [{ tool: 'read_file', meta: { nested: true } }],
+    quotaCounts: { read_file: 2 }
+  }, balanced);
+  assert.equal(Object.hasOwn(ctx, 'prepared'), false);
+  for (const value of [ctx, ctx.sources, ctx.sources[0], ctx.sources[0].injection, ctx.history, ctx.history[0], ctx.history[0].meta, ctx.quotaCounts, ctx.budgetExceeded, ctx.trustedPartsLower]) {
+    assert.equal(Object.isFrozen(value), true);
+  }
+  assert.equal(ctx.quotaCounts.get('read_file'), 2);
+  assert.throws(() => { ctx.sources[0].text = 'changed'; }, TypeError);
+  assert.throws(() => { ctx.history[0].meta.nested = false; }, TypeError);
+  assert.throws(() => { ctx.quotaCounts.get = () => 0; }, TypeError);
+  assert.throws(() => { ctx.budgetExceeded.push('changed'); }, TypeError);
+  assert.equal(ctx.quotaCounts.get('read_file'), 2);
+});
+
+test('throwing argument getters return guardError in direct evaluation and the compiled guard', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const input = () => {
+    const args = {};
+    Object.defineProperty(args, 'path', {
+      enumerable: true,
+      get() { throw new Error('args boom'); }
+    });
+    return { tool: 'read_file', args };
+  };
+  for (const verdict of [decide(input()), mod.checkToolCall(input())]) {
+    assert.equal(verdict.decision, 'deny');
+    assert.ok(verdict.findings.some((f) => f.rule === 'guardError' && f.message.includes('args boom')));
+  }
+});
+
+test('throwing context getters return guardError in direct evaluation and the compiled guard', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const context = {};
+  Object.defineProperty(context, 'untrusted', {
+    enumerable: true,
+    get() { throw new Error('context boom'); }
+  });
+  const call = { tool: 'read_file', args: { path: 'src/app.ts' } };
+  for (const verdict of [decide(call, context), mod.checkToolCall(call, context)]) {
+    assert.equal(verdict.decision, 'deny');
+    assert.ok(verdict.findings.some((f) => f.rule === 'guardError' && f.message.includes('context boom')));
+  }
+});

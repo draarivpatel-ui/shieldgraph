@@ -5,7 +5,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { SCENARIOS } from '../js/scenarios.mjs';
-import { traceArgumentText } from '../js/texttrace.mjs';
+import { traceArgumentText, safeValueString } from '../js/texttrace.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
@@ -107,12 +107,31 @@ test('text trace renders prototype-named arguments without inherited lookups or 
     findings: [{ rule: 'badArgs', arg: 'toString' }]
   };
   for (const arg of ['toString', 'constructor', '__proto__', 'valueOf']) {
-    const line = traceArgumentText(node, arg, 'copied', 'Filesystem read not reached (Blocked)', (v) => String(v));
+    const line = traceArgumentText(node, arg, 'copied', 'Filesystem read not reached (Blocked)');
     assert.ok(line.includes('origin not established'), arg);
     assert.ok(line.includes(`-> ${arg}`), arg);
   }
   const broken = { ...node, provenance: { toString: { endorsed: false } } };
-  assert.ok(traceArgumentText(broken, 'toString', 'copied', 'Filesystem read not reached (Blocked)', (v) => String(v)).includes('origin not established'));
+  assert.ok(traceArgumentText(broken, 'toString', 'copied', 'Filesystem read not reached (Blocked)').includes('origin not established'));
+});
+
+test('safe value formatting handles hostile object values without implicit conversion', () => {
+  const numericToString = { toString: 123 };
+  const nullProto = Object.create(null);
+  assert.equal(safeValueString(numericToString), '{"toString":123}');
+  assert.equal(safeValueString(nullProto), '{}');
+  assert.doesNotThrow(() => traceArgumentText({ provenance: {}, findings: [{ rule: 'badArgs', arg: 'path' }] }, 'path', numericToString, 'Filesystem read not reached (Blocked)'));
+  assert.doesNotThrow(() => traceArgumentText({ provenance: {}, findings: [{ rule: 'badArgs', arg: 'path' }] }, 'path', nullProto, 'Filesystem read not reached (Blocked)'));
+});
+
+test('safe value formatting caps depth, key count and output length', () => {
+  let deep = { leaf: 'x' };
+  for (let i = 0; i < 12; i += 1) deep = { next: deep };
+  const wide = {};
+  for (let i = 0; i < 30; i += 1) wide[`key${i}`] = 'x';
+  assert.ok(safeValueString(deep, 300).includes('truncated'));
+  assert.ok(safeValueString(wide, 300).includes('more keys'));
+  assert.ok(safeValueString({ text: 'x'.repeat(300) }, 120).length <= 120);
 });
 test('UI code never sets a style attribute (blocked by the CSP)', () => {
   for (const file of ['js/app.mjs', 'js/graph.mjs', 'js/report.mjs']) {

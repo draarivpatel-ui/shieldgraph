@@ -3,8 +3,10 @@
 // page exception, failed or external request, overflow, or broken flow.
 //
 //   node tests/browser-audit.mjs            (CHROME_PATH and CDP_TIMEOUT_MS optional)
+//   node tests/browser-audit.mjs --update-artifacts   (overwrite the tracked docs artifacts)
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -13,11 +15,14 @@ import { createServer } from '../tools/serve.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const chromePath = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const TIMEOUT = Number(process.env.CDP_TIMEOUT_MS || 45000);
-const shotsDir = path.join(root, 'docs', 'screenshots');
-const tmpRoot = '/private/tmp/agent-work/l1039-shieldgraph';
-fs.rmSync(tmpRoot, { recursive: true, force: true });
-const profileDir = tmpRoot;
+const updateArtifacts = process.argv.includes('--update-artifacts');
+const tmpRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'shieldgraph-audit-'));
+const profileDir = path.join(tmpRoot, 'chrome-profile');
 const downloadDir = path.join(tmpRoot, 'downloads');
+const artifactsRoot = updateArtifacts ? path.join(root, 'docs') : path.join(tmpRoot, 'artifacts');
+const shotsDir = path.join(artifactsRoot, 'screenshots');
+const auditPdfPath = path.join(artifactsRoot, 'security-audit-sample.pdf');
+fs.mkdirSync(profileDir, { recursive: true });
 fs.mkdirSync(downloadDir, { recursive: true });
 fs.mkdirSync(shotsDir, { recursive: true });
 
@@ -107,8 +112,7 @@ async function main() {
   const server = createServer(root);
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const origin = `http://127.0.0.1:${server.address().port}`;
-  let port;
-  do port = await freePort(); while (port === 9333 || port === 9335);
+  const port = await freePort();
 
   const chrome = spawn(chromePath, [
     '--headless=new', '--mute-audio', '--no-first-run', '--no-default-browser-check',
@@ -328,6 +332,26 @@ async function main() {
     await setField('#pg-args', '{ "markdown": ');
     check('invalid argument JSON shows an error and fails closed', /not valid JSON/.test(await text('#pg-args-err')) && !/Allowed/.test(await text('#pg-verdict')));
     await cdp.eval(`(() => { const s = document.getElementById('pg-tool'); s.value = 'read_file'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+    await setField('#pg-args', '{"path":{"toString":123}}');
+    const objectValueTrace = await text('#pg-text-trace-body');
+    check('text trace renders an object with a numeric toString without throwing', /\{"toString":123\}/.test(objectValueTrace) && /badArgs/.test(objectValueTrace) && /Blocked/.test(await text('#pg-verdict')), objectValueTrace.slice(0, 120));
+    const nullProtoTrace = await cdp.eval(`(async () => {
+      const [{ analyzeScenario, presetPolicy }, { traceArgumentText }] = await Promise.all([
+        import('/js/engine.mjs'), import('/js/texttrace.mjs')
+      ]);
+      const empty = Object.create(null);
+      const scenario = { id: 'null-proto-regression', label: 'attack', title: 'Null prototype regression', category: 'Regression', summary: '', nodes: [
+        { id: 't1', kind: 'tool', tool: 'read_file', args: { path: empty }, from: [], truth: 'malicious' }
+      ] };
+      const run = analyzeScenario(scenario, presetPolicy('balanced'));
+      const node = run.nodes.find((n) => n.id === 't1');
+      return {
+        decision: node.decision,
+        badArgs: node.findings.some((f) => f.rule === 'badArgs'),
+        line: traceArgumentText(node, 'path', node.args.path, 'Filesystem read not reached (Blocked)')
+      };
+    })()`);
+    check('text trace renders a null-prototype rejected object without throwing', nullProtoTrace.decision === 'deny' && nullProtoTrace.badArgs && /-> path "\{\}"/.test(nullProtoTrace.line), nullProtoTrace.line.slice(0, 120));
     await setField('#pg-args', '{"path":"a.txt","toString":"copied","constructor":"built","__proto__":{"polluted":true}}');
     const protoTrace = await text('#pg-text-trace-body');
     check('text trace renders prototype-named denied arguments without throwing', /-> toString/.test(protoTrace) && /-> constructor/.test(protoTrace) && /origin not established/.test(protoTrace) && /Blocked/.test(await text('#pg-verdict')), protoTrace.slice(0, 120));
@@ -387,7 +411,7 @@ async function main() {
       const buf = Buffer.from(pdf.data, 'base64');
       const pages = (buf.toString('latin1').match(/\/Type\s*\/Page(?!s)/g) || []).length;
       check(`print report is exactly 1 US Letter page (${mode} theme)`, pages === 1, `${pages} pages`);
-      if (mode === 'light') fs.writeFileSync(path.join(root, 'docs', 'security-audit-sample.pdf'), buf);
+      if (mode === 'light') fs.writeFileSync(auditPdfPath, buf);
     }
     for (const mode of ['light', 'dark']) {
       await theme(mode);

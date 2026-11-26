@@ -429,6 +429,38 @@ function scanUntrustedSource(key, text) {
   return scan;
 }
 
+function immutableQuotaCounts(counts) {
+  if (!counts) return null;
+  const entries = Object.freeze([...counts.entries()].map(([tool, count]) => Object.freeze([tool, count])));
+  const tools = Object.freeze(entries.map(([tool]) => tool));
+  const values = Object.freeze(entries.map(([, count]) => count));
+  const lookup = Object.create(null);
+  for (const [tool, count] of entries) {
+    Object.defineProperty(lookup, tool, { value: count, enumerable: true, writable: false, configurable: false });
+  }
+  Object.freeze(lookup);
+  const api = Object.create(null);
+  Object.defineProperties(api, {
+    size: { value: entries.length, enumerable: true, writable: false, configurable: false },
+    get: { value: (tool) => (hasOwn(lookup, tool) ? lookup[tool] : undefined), enumerable: true, writable: false, configurable: false },
+    has: { value: (tool) => hasOwn(lookup, tool), enumerable: true, writable: false, configurable: false },
+    entries: { value: () => entries[Symbol.iterator](), enumerable: true, writable: false, configurable: false },
+    keys: { value: () => tools[Symbol.iterator](), enumerable: true, writable: false, configurable: false },
+    values: { value: () => values[Symbol.iterator](), enumerable: true, writable: false, configurable: false },
+    forEach: {
+      value: (callback, thisArg) => {
+        if (typeof callback !== 'function') return;
+        for (const [tool, count] of entries) callback.call(thisArg, count, tool, api);
+      },
+      enumerable: true,
+      writable: false,
+      configurable: false
+    },
+    [Symbol.iterator]: { value: () => entries[Symbol.iterator](), enumerable: true, writable: false, configurable: false }
+  });
+  return Object.freeze(api);
+}
+
 function normalizeQuotaCounts(raw, policy) {
   if (raw === undefined || raw === null) return null;
   const entries = raw instanceof Map ? raw.entries() : (Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.entries(raw) : []));
@@ -441,7 +473,7 @@ function normalizeQuotaCounts(raw, policy) {
     if (typeof tool !== 'string' || !hasOwn(configuredTools, tool) || !Number.isFinite(count) || count <= 0) continue;
     counts.set(tool, (counts.get(tool) || 0) + Math.floor(count));
   }
-  return counts;
+  return immutableQuotaCounts(counts);
 }
 
 function hasOwnProtoKey(value) {
@@ -451,24 +483,65 @@ function hasOwnProtoKey(value) {
 function containsOwnProtoKey(value, state = { keys: 0, active: new Set() }, depth = 0) {
   if (!value || (typeof value !== 'object' && typeof value !== 'function')) return false;
   if (hasOwnProtoKey(value)) return true;
-  if (depth >= 8 || state.active.has(value)) return true;
+  if (depth >= 32 || state.active.has(value)) return true;
   state.keys += 1;
-  if (state.keys > 128) return true;
+  if (state.keys > 4096) return true;
   state.active.add(value);
   try {
-    for (const key of Object.keys(value)) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (descriptor && hasOwn(descriptor, 'value') && containsOwnProtoKey(descriptor.value, state, depth + 1)) return true;
+    if (value instanceof Map) {
+      for (const [key, entry] of value) {
+        if (containsOwnProtoKey(key, state, depth + 1) || containsOwnProtoKey(entry, state, depth + 1)) return true;
+      }
     }
-  } catch {
-    return true;
+    if (value instanceof Set) {
+      for (const entry of value) if (containsOwnProtoKey(entry, state, depth + 1)) return true;
+    }
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor) continue;
+      if (!hasOwn(descriptor, 'value')) continue;
+      if (containsOwnProtoKey(descriptor.value, state, depth + 1)) return true;
+    }
   } finally {
     state.active.delete(value);
   }
   return false;
 }
 
+function copyContextDatum(value, active = new Set(), depth = 0) {
+  if (!value || typeof value !== 'object') return value;
+  if (depth >= 32 || active.has(value)) throw cloneBudgetFailure('Context metadata is cyclic or nested too deeply.');
+  active.add(value);
+  const copy = Array.isArray(value) ? [] : Object.create(null);
+  try {
+    for (const key of Object.keys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !hasOwn(descriptor, 'value')) throw cloneBudgetFailure('Context metadata uses an accessor property.');
+      Object.defineProperty(copy, key, {
+        value: copyContextDatum(descriptor.value, active, depth + 1),
+        enumerable: true,
+        writable: false,
+        configurable: false
+      });
+    }
+  } finally {
+    active.delete(value);
+  }
+  return Object.freeze(copy);
+}
+
+function deepFreeze(value, seen = new WeakSet()) {
+  if (!value || typeof value !== 'object' || seen.has(value)) return value;
+  seen.add(value);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor && hasOwn(descriptor, 'value')) deepFreeze(descriptor.value, seen);
+  }
+  return Object.freeze(value);
+}
+
 const PROTO_KEY_CONTEXT_MESSAGE = 'Context object contains an own __proto__ key.';
+const PREPARED_CONTEXTS = new WeakSet();
 
 /**
  * Prepares a context once so many calls can be checked cheaply.
@@ -480,16 +553,13 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
   const budgetExceeded = [];
   const note = (reason) => { if (!budgetExceeded.includes(reason)) budgetExceeded.push(reason); };
 
-  const contextHasProtoKey = hasOwnProtoKey(context)
-    || [context.trusted, context.untrusted, context.secrets, context.history, context.quotaCounts].some(hasOwnProtoKey);
-  if (contextHasProtoKey) note(PROTO_KEY_CONTEXT_MESSAGE);
-  const rawHistory = Array.isArray(context.history) ? context.history : [];
-  const history = rawHistory.slice(-256);
+  const rejectContext = containsOwnProtoKey(context);
+  if (rejectContext) note(PROTO_KEY_CONTEXT_MESSAGE);
+  const rawHistory = rejectContext || !Array.isArray(context.history) ? [] : context.history;
+  const retainedHistory = rawHistory.slice(-256);
   const historyOverCap = rawHistory.length > 256;
   if (historyOverCap) note('Retained tool-call history exceeds 256 entries.');
-  const retainedHistoryHasProtoKey = !historyOverCap && history.some((entry) => containsOwnProtoKey(entry));
-  if (retainedHistoryHasProtoKey) note(PROTO_KEY_CONTEXT_MESSAGE);
-  const rejectContext = contextHasProtoKey || retainedHistoryHasProtoKey;
+  const history = historyOverCap || rejectContext ? [] : retainedHistory.map((entry) => copyContextDatum(entry));
   const quotaCounts = rejectContext ? null : normalizeQuotaCounts(context.quotaCounts, policy);
 
   let contextItems = 0;
@@ -568,16 +638,19 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
     if (held.text.length >= 8) secrets.push(held.text);
   }
 
-  return {
-    prepared: true,
+  const prepared = {
     trustedText,
     trustedLower: lower(deobfuscate(trustedText).text),
+    trustedPartsLower: trustedParts.map((part) => lower(deobfuscate(part).text)),
     sources,
     secrets,
     history,
     quotaCounts,
     budgetExceeded
   };
+  deepFreeze(prepared);
+  PREPARED_CONTEXTS.add(prepared);
+  return prepared;
 }
 
 export function traceValue(value, ctx, work = null) {
@@ -724,10 +797,10 @@ function markdownFindings(markdown, ctx, policy) {
 const SHELL_OPERATOR_PATTERN = /[;|&`]|\$\(|\n/;
 const MIN_OPERATOR_WITNESS = 6;
 
-function shellOperatorWitness(text, haystack, trustedLower) {
+function shellOperatorWitness(text, haystack, trustedPartsLower) {
   const x = String(text).slice(0, 4000);
   const y = String(haystack).slice(0, 4000);
-  if (x.length < MIN_OPERATOR_WITNESS || y.length < MIN_OPERATOR_WITNESS) return '';
+  if (x.length < MIN_OPERATOR_WITNESS || y.length < MIN_OPERATOR_WITNESS) return null;
   const positions = new Map();
   for (let j = 0; j + MIN_OPERATOR_WITNESS <= y.length; j += 1) {
     const key = y.slice(j, j + MIN_OPERATOR_WITNESS);
@@ -735,9 +808,10 @@ function shellOperatorWitness(text, haystack, trustedLower) {
   }
   for (let i = 0; i + MIN_OPERATOR_WITNESS <= x.length; i += 1) {
     const witness = x.slice(i, i + MIN_OPERATOR_WITNESS);
-    if (!SHELL_OPERATOR_PATTERN.test(witness)) continue;
+    const operator = witness.match(SHELL_OPERATOR_PATTERN);
+    if (!operator) continue;
     const yFirst = positions.get(witness);
-    if (yFirst === undefined || trustedLower.includes(witness)) continue;
+    if (yFirst === undefined) continue;
     let start = i;
     let end = i + MIN_OPERATOR_WITNESS;
     let yStart = yFirst;
@@ -750,9 +824,26 @@ function shellOperatorWitness(text, haystack, trustedLower) {
       end += 1;
       yEnd += 1;
     }
-    return x.slice(start, end);
+    const run = x.slice(start, end);
+    if ((Array.isArray(trustedPartsLower) ? trustedPartsLower : []).some((part) => part.includes(run))) continue;
+    return {
+      text: run,
+      operatorIndex: i - start + operator.index,
+      operatorLength: operator[0].length
+    };
   }
-  return '';
+  return null;
+}
+
+function shellOperatorExcerpt(run, operatorIndex, operatorLength, max = 60) {
+  const text = String(run);
+  if (text.length <= max) return text;
+  const operatorMiddle = operatorIndex + operatorLength / 2;
+  let start = Math.max(0, Math.floor(operatorMiddle - max / 2));
+  if (start + max > text.length) start = text.length - max;
+  if (start > operatorIndex) start = operatorIndex;
+  const end = Math.min(text.length, start + max);
+  return text.slice(start, end);
 }
 
 function shellFindings(cmd, ctx, work = null) {
@@ -781,9 +872,10 @@ function shellFindings(cmd, ctx, work = null) {
           budgetFull = true;
           break;
         }
-        const run = shellOperatorWitness(textLower, src.haystack, ctx.trustedLower);
+        const run = shellOperatorWitness(textLower, src.haystack, ctx.trustedPartsLower);
         if (run) {
-          hit = { rule: 'shellMetaFromUntrusted', severity: 'critical', message: `Shell operators came from ${src.origin}: "${run.trim().slice(0, 60)}".` };
+          const excerpt = shellOperatorExcerpt(run.text, run.operatorIndex, run.operatorLength);
+          hit = { rule: 'shellMetaFromUntrusted', severity: 'critical', message: `Shell operators came from ${src.origin}: "${excerpt}".` };
           break;
         }
       }
@@ -869,20 +961,33 @@ function argFindings(tool, spec, args, ctx, policy, work = null) {
  * Decides one tool call. Returns { decision, risk, findings, matched, provenance }.
  * Fails closed: any exception becomes a deny.
  */
+function guardErrorVerdict(error) {
+  let message = 'unreadable guard error';
+  try {
+    const raw = error && typeof error === 'object' && error.message !== undefined ? error.message : error;
+    if (typeof raw === 'string') message = raw;
+    else if (raw === null || ['number', 'boolean', 'bigint', 'undefined', 'symbol'].includes(typeof raw)) message = String(raw);
+    else message = Object.prototype.toString.call(raw);
+  } catch {
+    message = 'unreadable guard error';
+  }
+  return {
+    decision: 'deny',
+    risk: 100,
+    findings: [{ rule: 'guardError', severity: 'critical', message: `Guard error: ${message.slice(0, 160)}`, action: 'deny' }],
+    matched: [{ rule: 'guardError', action: 'deny' }],
+    provenance: {},
+    details: {}
+  };
+}
+
 export function evaluateCall(call, context = {}, policy = PRESETS.balanced) {
   try {
     const snapshot = snapshotCall(call);
     if (snapshot.verdict) return snapshot.verdict;
     return evaluateCallUnsafe(snapshot.call, context, policy);
   } catch (error) {
-    return {
-      decision: 'deny',
-      risk: 100,
-      findings: [{ rule: 'guardError', severity: 'critical', message: `Guard error: ${String(error && error.message || error).slice(0, 160)}`, action: 'deny' }],
-      matched: [{ rule: 'guardError', action: 'deny' }],
-      provenance: {},
-      details: {}
-    };
+    return guardErrorVerdict(error);
   }
 }
 
@@ -891,7 +996,7 @@ function budgetFindings(work) {
 }
 
 function evaluateCallUnsafe(call, rawContext, policy) {
-  const ctx = rawContext && rawContext.prepared ? rawContext : prepareContext(rawContext || {}, policy);
+  const ctx = rawContext && PREPARED_CONTEXTS.has(rawContext) ? rawContext : prepareContext(rawContext || {}, policy);
   const work = createWorkBudget();
   for (const reason of ctx.budgetExceeded || []) exceedBudget(work, reason);
   const tool = call && typeof call.tool === 'string' ? call.tool : '';
@@ -946,7 +1051,7 @@ function evaluateCallUnsafe(call, rawContext, policy) {
     return finalize(findings, policy, toolPolicy.action, {}, {});
   }
 
-  const priorCalls = ctx.quotaCounts instanceof Map
+  const priorCalls = ctx.quotaCounts && typeof ctx.quotaCounts.get === 'function'
     ? (ctx.quotaCounts.get(tool) || 0)
     : ctx.history.filter((h) => h && h.tool === tool).length;
   if (priorCalls >= toolPolicy.maxCalls) findings.push({ rule: 'rateLimit', severity: 'high', message: `${tool} already ran ${priorCalls} times (cap ${toolPolicy.maxCalls}).` });

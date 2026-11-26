@@ -47,9 +47,13 @@ export class ShieldGraphBlocked extends Error {
 
 /** Checks one tool call against the compiled policy without side effects. */
 export function checkToolCall(call, context = {}) {
-  const snapshot = snapshotCall(call);
-  if (snapshot.verdict) return snapshot.verdict;
-  return evaluateCall(snapshot.call, context, SHIELDGRAPH_POLICY);
+  try {
+    const snapshot = snapshotCall(call);
+    if (snapshot.verdict) return snapshot.verdict;
+    return evaluateCall(snapshot.call, context, SHIELDGRAPH_POLICY);
+  } catch (error) {
+    return guardErrorVerdict(error);
+  }
 }
 
 function frozenVerdict(rawVerdict) {

@@ -21,7 +21,7 @@ ShieldGraph replays an agent trace and draws it as a live flow graph with four c
 - **Confused-deputy checks.** A payment or email can only go to an account or address the user actually named.
 - **Red-team playground.** Edit any payload or tool call and the verdict updates as you type. One-click fuzz buttons re-encode the payload as Base64, zero-width splits, homoglyphs, percent-encoding or HTML entities so you can watch the detectors still catch it.
 - **Benchmark.** Fourteen scenarios, ten attacks and four ordinary developer workflows, with every tool call labeled by hand. Switching between the Permissive, Balanced and Zero-Trust presets, or editing rules live, recomputes precision, recall, F1 and the false positive rate.
-- **Policy compiler.** Edit the JSON manifest or flip rule actions in a table, then export a runnable `shieldgraph-guard.mjs`, the policy JSON, and a one-page printable security audit sheet.
+- **Policy compiler.** Edit the JSON manifest or flip any of the 41 rule actions in a table, then export a runnable `shieldgraph-guard.mjs`, the policy JSON, and a one-page printable security audit sheet.
 
 | Policy | Malicious calls caught | Benign calls interrupted | Precision | Recall | F1 | False positive rate | Denied | Held for approval |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -37,7 +37,7 @@ ShieldGraph is plain JavaScript ES modules, HTML and CSS with zero dependencies,
 
 The flow graph is hand-built SVG, the display face ShieldGraph Plot is a monoline font drawn stroke by stroke with a Python script, and the page runs under a strict Content Security Policy with no inline script and no markup ever built from payload text.
 
-Testing covers 314 Node unit tests (including bypass attempts, benign false-positive cases, guard parity, WCAG contrast computed from the real color tokens, and a scanner that proves itself on planted probes) plus a headless Chrome audit at desktop, tablet and phone sizes that clicks through every view, runs the fuzzer and an XSS payload, downloads the guard and runs it in Node, and checks the audit sheet prints on exactly one US Letter page.
+Testing covers 324 Node unit tests (including bypass attempts, benign false-positive cases, guard parity, WCAG contrast computed from the real color tokens, and a scanner that proves itself on planted probes) plus a headless Chrome audit at desktop, tablet and phone sizes that clicks through every view, runs the fuzzer and an XSS payload, downloads the guard and runs it in Node, and checks the audit sheet prints on exactly one US Letter page.
 
 ## Challenges we ran into
 
@@ -49,7 +49,7 @@ The guard you download is the same code that drew the verdicts on screen, and a 
 
 ## What we learned
 
-Provenance is a stronger signal than wording. Attackers can rephrase an instruction forever, but the payee account, the URL or the shell operator still has to come from somewhere, and the firewall can see where.
+Provenance is a stronger signal than wording. Attackers can rephrase an instruction forever, but the payee account, the URL or the shell operator still has to match text the firewall retained, and an argument without a match is labeled `origin not established` rather than proven safe.
 
 ## What's next for ShieldGraph
 

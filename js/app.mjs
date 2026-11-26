@@ -6,7 +6,7 @@ import { compileGuard, loadGuardSources, stableStringify, sha256Hex } from './co
 import { renderGraph, STATUS_TEXT, STATUS_ICON } from './graph.mjs';
 import { renderReport } from './report.mjs';
 import { scoreInjection } from './injection.mjs';
-import { traceArgumentText } from './texttrace.mjs';
+import { traceArgumentText, safeValueString } from './texttrace.mjs';
 
 const $ = (sel) => document.querySelector(sel);
 const LABELS = { permissive: 'Permissive', balanced: 'Balanced', zeroTrust: 'Zero-Trust', custom: 'Custom' };
@@ -271,7 +271,7 @@ function initListKeys() {
 }
 
 function oneLine(value, max = 90) {
-  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  const text = safeValueString(value, max + 40).replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 

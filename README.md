@@ -66,7 +66,7 @@ const out = await guard.run({ tool: 'shell_exec', args: { cmd } }, (args, frozen
 
 Tool results feed back into the context. Files read with `read_file` count as internal content, which the Balanced preset trusts, so pass third-party files (a cloned repo's README, a downloaded PDF) through `guard.addUntrusted` yourself.
 
-The guard file is built by concatenating the exact detector modules the workbench runs, so the two cannot drift. A parity test imports the compiled guard for every preset and checks that it returns the same decision, risk and rule list as the engine for all 29 calls. Execution tests prove that allowed calls reach a mock executor, denied or rejected calls never do, held calls wait for the approval callback, and concurrent calls reserve per-tool quota before yielding.
+The guard file is built by concatenating the exact detector modules the workbench runs. Automated regression tests verify the two for parity by importing the compiled guard for every preset and checking that it returns the same decision, risk and rule list as the engine for all 29 calls. Execution tests prove that allowed calls reach a mock executor, denied or rejected calls never do, held calls wait for the approval callback, and concurrent calls reserve per-tool quota before yielding.
 
 ## Scope and limits
 
@@ -81,7 +81,7 @@ ShieldGraph is deterministic static and taint analysis of recorded traces. It is
 ## Tests
 
 ```sh
-npm test         # 314 Node unit tests (engine, policy and guard parity, craft)
+npm test         # 324 Node unit tests (engine, policy and guard parity, craft)
 npm run audit    # headless Chrome audit at 1440x900, 820x1180 and 390x844
 ```
 
