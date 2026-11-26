@@ -5,6 +5,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { SCENARIOS } from '../js/scenarios.mjs';
+import { traceArgumentText } from '../js/texttrace.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
@@ -93,8 +94,25 @@ test('UI code never writes markup from strings', () => {
 });
 test('text trace never calls an unmatched argument trusted', () => {
   const app = read('js/app.mjs');
-  assert.ok(app.includes('no untrusted source match (origin not established)'));
+  const trace = read('js/texttrace.mjs');
+  assert.ok(trace.includes('no untrusted source match (origin not established)'));
   assert.ok(!app.includes('trusted user or planner input'));
+  assert.ok(!trace.includes('trusted user or planner input'));
+});
+
+test('text trace renders prototype-named arguments without inherited lookups or missing-source throws', () => {
+  const node = {
+    args: { toString: 'copied', constructor: 'built' },
+    provenance: {},
+    findings: [{ rule: 'badArgs', arg: 'toString' }]
+  };
+  for (const arg of ['toString', 'constructor', '__proto__', 'valueOf']) {
+    const line = traceArgumentText(node, arg, 'copied', 'Filesystem read not reached (Blocked)', (v) => String(v));
+    assert.ok(line.includes('origin not established'), arg);
+    assert.ok(line.includes(`-> ${arg}`), arg);
+  }
+  const broken = { ...node, provenance: { toString: { endorsed: false } } };
+  assert.ok(traceArgumentText(broken, 'toString', 'copied', 'Filesystem read not reached (Blocked)', (v) => String(v)).includes('origin not established'));
 });
 test('UI code never sets a style attribute (blocked by the CSP)', () => {
   for (const file of ['js/app.mjs', 'js/graph.mjs', 'js/report.mjs']) {

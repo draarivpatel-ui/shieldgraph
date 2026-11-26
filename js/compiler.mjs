@@ -52,162 +52,6 @@ export function checkToolCall(call, context = {}) {
   return evaluateCall(snapshot.call, context, SHIELDGRAPH_POLICY);
 }
 
-const INPUT_CLONE_LIMITS = Object.freeze({
-  maxKeys: WORK_LIMITS.maxObjectKeys,
-  maxStrings: WORK_LIMITS.maxCollectedStrings,
-  maxDepth: WORK_LIMITS.maxCollectDepth,
-  maxStringChars: WORK_LIMITS.maxArgumentChars,
-  maxStringBytes: WORK_LIMITS.maxArgumentBytes,
-  maxTotalChars: WORK_LIMITS.maxCallChars,
-  maxTotalBytes: WORK_LIMITS.maxCallBytes
-});
-
-// Verdicts are produced by the bounded evaluator, so their copy budget is
-// larger than the input budget but still finite.
-const GENERATED_CLONE_LIMITS = Object.freeze({
-  maxKeys: 131072,
-  maxStrings: 131072,
-  maxDepth: 24,
-  maxStringChars: 65536,
-  maxStringBytes: 262144,
-  maxTotalChars: 1048576,
-  maxTotalBytes: 4194304
-});
-
-function cloneBudgetFailure(message) {
-  const error = new Error(message);
-  error.name = 'ShieldGraphCloneBudget';
-  error.rule = 'budgetExceeded';
-  return error;
-}
-
-function cloneFail(message) {
-  throw cloneBudgetFailure(message);
-}
-
-function utf8ByteLength(text, stopAt) {
-  let bytes = 0;
-  for (let i = 0; i < text.length; i += 1) {
-    const code = text.charCodeAt(i);
-    if (code < 128) bytes += 1;
-    else if (code < 2048) bytes += 2;
-    else if (code >= 55296 && code <= 56319 && i + 1 < text.length && text.charCodeAt(i + 1) >= 56320 && text.charCodeAt(i + 1) <= 57343) {
-      bytes += 4;
-      i += 1;
-    } else bytes += 3;
-    if (bytes > stopAt) return bytes;
-  }
-  return bytes;
-}
-
-function chargeCloneString(text, state, label, scalar) {
-  const limits = state.limits;
-  if (text.length > limits.maxStringChars) {
-    cloneFail(label + ' is ' + text.length + ' chars, above the hard argument cap of ' + limits.maxStringChars + '.');
-  }
-  if (state.chars + text.length > limits.maxTotalChars) {
-    cloneFail('Tool call structure carries more than ' + limits.maxTotalChars + ' string chars.');
-  }
-  const byteRoom = Math.min(limits.maxStringBytes, limits.maxTotalBytes - state.bytes);
-  const bytes = utf8ByteLength(text, byteRoom);
-  if (bytes > limits.maxStringBytes) {
-    cloneFail(label + ' is ' + bytes + ' bytes, above the hard argument cap of ' + limits.maxStringBytes + '.');
-  }
-  if (state.bytes + bytes > limits.maxTotalBytes) {
-    cloneFail('Tool call structure carries more than ' + limits.maxTotalBytes + ' string bytes.');
-  }
-  state.chars += text.length;
-  state.bytes += bytes;
-  if (scalar) {
-    state.strings += 1;
-    if (state.strings > limits.maxStrings) cloneFail('Tool call structure has more than ' + limits.maxStrings + ' scalar values.');
-  }
-}
-
-function countCloneKey(state) {
-  state.keys += 1;
-  if (state.keys > state.limits.maxKeys) cloneFail('Tool call structure has more than ' + state.limits.maxKeys + ' enumerable keys.');
-}
-
-function cloneKey(input, key, copy, state, depth) {
-  if (typeof key === 'string') chargeCloneString(key, state, 'Object key', false);
-  const value = cloneValue(input[key], state, depth + 1);
-  Object.defineProperty(copy, key, { value, enumerable: true, writable: false, configurable: false });
-}
-
-function cloneValue(value, state, depth) {
-  if (typeof value === 'string') {
-    chargeCloneString(value, state, 'Argument string', true);
-    return value;
-  }
-  if (!value || typeof value !== 'object') return value;
-  if (depth > state.limits.maxDepth) cloneFail('Tool call structure is nested deeper than ' + state.limits.maxDepth + ' levels.');
-  if (state.active.has(value)) cloneFail('Tool call structure contains a cycle.');
-  state.active.add(value);
-  const copy = Array.isArray(value) ? [] : Object.create(null);
-  try {
-    for (const key in value) {
-      countCloneKey(state);
-      if (Object.hasOwn(value, key)) cloneKey(value, key, copy, state, depth);
-    }
-    for (const key of Object.getOwnPropertySymbols(value)) {
-      countCloneKey(state);
-      if (Object.prototype.propertyIsEnumerable.call(value, key)) cloneKey(value, key, copy, state, depth);
-    }
-  } finally {
-    state.active.delete(value);
-  }
-  return Object.freeze(copy);
-}
-
-function cloneWithLimits(value, limits) {
-  const state = { limits, keys: 0, strings: 0, chars: 0, bytes: 0, active: new Set() };
-  return cloneValue(value, state, -1);
-}
-
-function cloneFrozen(value) {
-  return cloneWithLimits(value, INPUT_CLONE_LIMITS);
-}
-
-function cloneGeneratedFrozen(value) {
-  return cloneWithLimits(value, GENERATED_CLONE_LIMITS);
-}
-
-function frozenEmptyObject() {
-  return Object.freeze(Object.create(null));
-}
-
-function budgetVerdict(message) {
-  const finding = Object.freeze({ rule: 'budgetExceeded', severity: 'critical', message, action: 'deny' });
-  const matched = Object.freeze({ rule: 'budgetExceeded', action: 'deny' });
-  return Object.freeze({
-    decision: 'deny',
-    risk: 100,
-    findings: Object.freeze([finding]),
-    matched: Object.freeze([matched]),
-    provenance: frozenEmptyObject(),
-    details: frozenEmptyObject(),
-    effect: 'unknown'
-  });
-}
-
-function fallbackCall(input) {
-  const tool = input && typeof input === 'object' && typeof input.tool === 'string' ? input.tool.slice(0, 160) : '';
-  const call = Object.create(null);
-  Object.defineProperty(call, 'tool', { value: tool, enumerable: true, writable: false, configurable: false });
-  Object.defineProperty(call, 'args', { value: frozenEmptyObject(), enumerable: true, writable: false, configurable: false });
-  return Object.freeze(call);
-}
-
-function snapshotCall(input) {
-  try {
-    return { call: cloneFrozen(input), verdict: null };
-  } catch (error) {
-    if (!error || error.rule !== 'budgetExceeded') throw error;
-    return { call: fallbackCall(input), verdict: budgetVerdict(error.message) };
-  }
-}
-
 function frozenVerdict(rawVerdict) {
   try {
     return cloneGeneratedFrozen(rawVerdict);
@@ -216,10 +60,41 @@ function frozenVerdict(rawVerdict) {
   }
 }
 
-function quotaWithReservations(quotaCounts, reservations) {
-  const merged = new Map(quotaCounts);
-  for (const [tool, count] of reservations) merged.set(tool, (merged.get(tool) || 0) + count);
+function quotaWithReservations(quotaCounts, reservations, policy) {
+  const tools = policy && policy.tools && typeof policy.tools === 'object' ? policy.tools : {};
+  const merged = new Map();
+  for (const [tool, count] of quotaCounts) if (hasOwn(tools, tool)) merged.set(tool, count);
+  for (const [tool, count] of reservations) {
+    if (hasOwn(tools, tool)) merged.set(tool, (merged.get(tool) || 0) + count);
+  }
   return merged;
+}
+
+function copyContextValue(value, state, depth) {
+  if (!value || typeof value !== 'object') return value;
+  if (depth > 32) throw new Error('Context snapshot is nested too deeply.');
+  if (state.active.has(value)) throw new Error('Context snapshot contains a cycle.');
+  state.active.add(value);
+  const copy = Array.isArray(value) ? [] : Object.create(null);
+  try {
+    for (const key of Object.keys(value)) {
+      state.keys += 1;
+      if (state.keys > 131072) throw new Error('Context snapshot has too many keys.');
+      Object.defineProperty(copy, key, {
+        value: copyContextValue(value[key], state, depth + 1),
+        enumerable: true,
+        writable: false,
+        configurable: false
+      });
+    }
+  } finally {
+    state.active.delete(value);
+  }
+  return Object.freeze(copy);
+}
+
+function snapshotContext(context) {
+  return copyContextValue(context, { keys: 0, active: new Set() }, 0);
 }
 
 /**
@@ -233,6 +108,7 @@ export function createGuard(options = {}) {
   const quotaCounts = new Map();
   const reservations = new Map();
   const reserve = (tool) => {
+    if (!hasOwn(SHIELDGRAPH_POLICY.tools, tool)) return () => {};
     reservations.set(tool, (reservations.get(tool) || 0) + 1);
     let held = true;
     return () => {
@@ -243,7 +119,7 @@ export function createGuard(options = {}) {
       else reservations.delete(tool);
     };
   };
-  const quotaContext = () => ({ ...context, quotaCounts: quotaWithReservations(quotaCounts, reservations) });
+  const quotaContext = () => ({ ...context, quotaCounts: quotaWithReservations(quotaCounts, reservations, SHIELDGRAPH_POLICY) });
   const guard = {
     addTrusted(text) {
       context = { ...context, trusted: [...context.trusted, String(text)] };
@@ -270,7 +146,7 @@ export function createGuard(options = {}) {
         if (quotaCommitted) return;
         quotaCommitted = true;
         const tool = call && typeof call.tool === 'string' ? call.tool : '';
-        quotaCounts.set(tool, (quotaCounts.get(tool) || 0) + 1);
+        recordQuotaCall(quotaCounts, tool, SHIELDGRAPH_POLICY);
       };
       try {
         if (typeof options.onDecision === 'function') await options.onDecision(call, verdict);
@@ -306,7 +182,7 @@ export function createGuard(options = {}) {
       }
     },
     get context() {
-      return context;
+      return snapshotContext(context);
     },
     get quotaCounts() {
       return new Map(quotaCounts);

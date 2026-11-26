@@ -6,6 +6,7 @@ import { compileGuard, loadGuardSources, stableStringify, sha256Hex } from './co
 import { renderGraph, STATUS_TEXT, STATUS_ICON } from './graph.mjs';
 import { renderReport } from './report.mjs';
 import { scoreInjection } from './injection.mjs';
+import { traceArgumentText } from './texttrace.mjs';
 
 const $ = (sel) => document.querySelector(sel);
 const LABELS = { permissive: 'Permissive', balanced: 'Balanced', zeroTrust: 'Zero-Trust', custom: 'Custom' };
@@ -279,18 +280,7 @@ function renderTextTrace(run, target) {
   const items = tools.map((node) => {
     const effect = EFFECT_LABELS[node.effect] || 'Unknown effect';
     const outcome = `${effect} ${node.decision === 'allow' || node.decision === 'log' ? 'reached' : 'not reached'} (${STATUS_TEXT[node.decision]})`;
-    const args = Object.entries(node.args || {}).map(([arg, value]) => {
-      const trace = node.provenance && node.provenance[arg];
-      let source = 'no untrusted source match (origin not established)';
-      if (trace && trace.sources.length) {
-        const seen = trace.sources.map((s) => `${s.origin} (${s.how})`).join(' or ');
-        source = trace.endorsed ? `user-endorsed value also seen in ${seen}` : seen;
-      }
-      const matched = node.findings.filter((f) => !f.arg || f.arg === arg).map((f) => f.rule);
-      const rulesText = matched.length ? matched.join(', ') : 'no rule matched';
-      const shown = oneLine(value);
-      return h('li', {}, `${source} -> ${arg}${shown ? ` "${shown}"` : ''} -> ${rulesText} -> ${outcome}`);
-    });
+    const args = Object.entries(node.args || {}).map(([arg, value]) => h('li', {}, traceArgumentText(node, arg, value, outcome, oneLine)));
     return h('li', {},
       h('div', { class: 'trace-tool' }, h('code', {}, `${node.id} ${node.tool}`), badge(node.decision, 'badge-sm')),
       h('ul', { class: 'trace-args' }, args));

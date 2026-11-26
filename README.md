@@ -1,6 +1,6 @@
 # ShieldGraph
 
-ShieldGraph is a firewall and red-team workbench for the tool calls an AI agent makes. It replays an agent trace (user prompt, untrusted content, planner, tool calls, effects), tracks where every argument came from, peels off the obfuscation attackers use, and decides whether each call is allowed, logged, held for a human, or blocked. The same decision code compiles into `shieldgraph-guard.mjs`, a zero-dependency middleware you can drop in front of a real agent's tool executor.
+ShieldGraph is a firewall and red-team workbench for the tool calls an AI agent makes. It replays an agent trace (user prompt, untrusted content, planner, tool calls, effects), checks arguments for untrusted text-match evidence, marks arguments without a match as `origin not established`, peels off the obfuscation attackers use, and decides whether each call is allowed, logged, held for a human, or blocked. The same decision code compiles into `shieldgraph-guard.mjs`, a zero-dependency middleware you can drop in front of a real agent's tool executor.
 
 Everything runs in the browser. No API keys, no external requests or model calls, no build step, no dependencies. The browser fetches only same-origin static files, including the detector module sources needed to compile a guard export; guard and policy exports are generated locally as downloads.
 
@@ -16,14 +16,14 @@ Node.js 22 or newer is required for the tests, guard build and generated middlew
 
 ## What it does
 
-- **Taint and provenance tracking.** Every string argument is traced back through the trace. A value the user typed is endorsed. A value copied from a web page, email, README, PDF, webhook or tool output (verbatim, as a partial copy of 20+ characters, or only after decoding) is tainted, and a tainted value reaching a privileged tool raises a finding. Endorsement matches whole tokens, so `a@client.example` is not endorsed by `ana@client.example`.
+- **Taint and provenance tracking.** String arguments are checked for verbatim, partial-copy and decoded matches against trusted and untrusted text. A value the user typed is endorsed. A value copied from a web page, email, README, PDF, webhook or tool output is tainted, and a tainted value reaching a privileged tool raises a finding. An argument with no untrusted text match is labeled `origin not established`, not proven safe. Endorsement matches whole tokens, so `a@client.example` is not endorsed by `ana@client.example`.
 - **De-obfuscation pipeline.** Invisible characters and Unicode tag smuggling are stripped, HTML entities and multi-round percent-encoding (`%252e`) decoded, text folded with NFKC and a Cyrillic and Greek homoglyph map, and Base64, hex and `\x` payloads extracted when they decode to readable text. Binary results such as git SHAs and npm integrity hashes are rejected, so they do not cause false alarms.
 - **SSRF and egress guard.** URLs go through the WHATWG parser, so decimal (`2852039166`), octal, hex and short-form IPv4 are normalized first and then flagged as obfuscated. Private, loopback, link-local, CGNAT, multicast and metadata ranges are blocked for IPv4 and IPv6, including IPv4-mapped and NAT64 addresses. Also caught are `allowed.com@evil.com` userinfo tricks, non-http schemes, punycode and ASCII lookalike hosts, secrets in query strings, and data encoded into DNS labels.
 - **Path guard.** Paths are canonicalized without touching disk (`~`, `$HOME`, backslashes, NUL suffixes, encoded dot segments) and checked for workspace escape, credential files (`.env`, `~/.ssh`, `~/.aws/credentials`, keychains, the GitHub CLI token file and more), persistence targets (shell rc files, git hooks, launch agents, CI workflows) and procfs link escapes.
 - **Shell analysis.** A small POSIX lexer splits commands the way `sh` would, honoring quotes, then flags pipe-to-interpreter, reverse shells, destructive commands, network tools, permission changes, symlink planting and decode-and-run chains. Wrappers do not hide a payload, because `sh -c` scripts and `$( )`, backtick and `<( )` substitutions are re-analyzed up to three levels deep, and every argument is checked as a path (so `head .env` is caught like `cat .env`). Shell operators that arrived inside untrusted text are treated as command injection.
 - **Prompt-injection scoring.** Ten signal families (authority override, fake role markers, delimiter breakout, agent-addressed orders, secrecy requests, tool directives, exfiltration verbs, urgency, hidden carriers, markdown beacon templates) run on the decoded text and combine like independent probabilities.
 - **Confused-deputy checks.** Email recipients and payment accounts must have been named by the user. A wire to an account that appears only in an inbound email is blocked.
-- **Policy compiler.** Policies are JSON manifests with a per-tool action, argument length cap and call cap, plus an action for each of 40 rules. Validation rejects unknown keys, and any rule left out defaults to deny. Exports are the runnable guard, the policy JSON and a one-page printable audit sheet.
+- **Policy compiler.** Policies are JSON manifests with a per-tool action, argument length cap and call cap, plus an action for each of 41 rules. Validation rejects unknown keys, and any rule left out defaults to deny. Exports are the runnable guard, the policy JSON and a one-page printable audit sheet.
 
 ## Benchmark
 
@@ -81,7 +81,7 @@ ShieldGraph is deterministic static and taint analysis of recorded traces. It is
 ## Tests
 
 ```sh
-npm test         # Node unit tests (engine, policy and guard parity, craft)
+npm test         # 314 Node unit tests (engine, policy and guard parity, craft)
 npm run audit    # headless Chrome audit at 1440x900, 820x1180 and 390x844
 ```
 
@@ -100,7 +100,7 @@ The browser audit drives the real UI with pointer clicks and key presses. It che
 | `js/engine.mjs` | Trace replay, taint graph and benchmark metrics |
 | `js/compiler.mjs` | Builds `shieldgraph-guard.mjs` from the detector sources |
 | `js/scenarios.mjs` | The 14 labeled scenarios |
-| `js/app.mjs`, `js/graph.mjs`, `js/report.mjs` | Workbench UI, SVG flow graph, printable audit sheet |
+| `js/app.mjs`, `js/graph.mjs`, `js/report.mjs`, `js/texttrace.mjs` | Workbench UI, SVG flow graph, printable audit sheet, text trace rendering |
 | `fonts/shieldgraph-plot.woff2` | ShieldGraph Plot, the monoline display face, drawn by `tools/build-font.py` |
 | `tests/` | Unit, parity, craft and browser audit suites |
 

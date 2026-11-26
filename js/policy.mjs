@@ -161,6 +161,167 @@ export function appendHistoryEntry(context, tool) {
   return { ...base, history: [...history, { tool }].slice(-256) };
 }
 
+export function recordQuotaCall(quotaCounts, tool, policy) {
+  const tools = policy && policy.tools && typeof policy.tools === 'object' ? policy.tools : {};
+  if (!(quotaCounts instanceof Map) || typeof tool !== 'string' || !hasOwn(tools, tool)) return false;
+  quotaCounts.set(tool, (quotaCounts.get(tool) || 0) + 1);
+  return true;
+}
+
+const INPUT_CLONE_LIMITS = Object.freeze({
+  maxKeys: WORK_LIMITS.maxObjectKeys,
+  maxStrings: WORK_LIMITS.maxCollectedStrings,
+  maxDepth: WORK_LIMITS.maxCollectDepth,
+  maxStringChars: WORK_LIMITS.maxArgumentChars,
+  maxStringBytes: WORK_LIMITS.maxArgumentBytes,
+  maxTotalChars: WORK_LIMITS.maxCallChars,
+  maxTotalBytes: WORK_LIMITS.maxCallBytes
+});
+
+const GENERATED_CLONE_LIMITS = Object.freeze({
+  maxKeys: 131072,
+  maxStrings: 131072,
+  maxDepth: 24,
+  maxStringChars: 65536,
+  maxStringBytes: 262144,
+  maxTotalChars: 1048576,
+  maxTotalBytes: 4194304
+});
+
+function cloneBudgetFailure(message) {
+  const error = new Error(message);
+  error.name = 'ShieldGraphCloneBudget';
+  error.rule = 'budgetExceeded';
+  return error;
+}
+
+function cloneFail(message) {
+  throw cloneBudgetFailure(message);
+}
+
+function utf8ByteLength(text, stopAt) {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 128) bytes += 1;
+    else if (code < 2048) bytes += 2;
+    else if (code >= 55296 && code <= 56319 && i + 1 < text.length && text.charCodeAt(i + 1) >= 56320 && text.charCodeAt(i + 1) <= 57343) {
+      bytes += 4;
+      i += 1;
+    } else bytes += 3;
+    if (bytes > stopAt) return bytes;
+  }
+  return bytes;
+}
+
+function chargeCloneString(text, state, label, scalar) {
+  const limits = state.limits;
+  if (text.length > limits.maxStringChars) {
+    cloneFail(label + ' is ' + text.length + ' chars, above the hard argument cap of ' + limits.maxStringChars + '.');
+  }
+  if (state.chars + text.length > limits.maxTotalChars) {
+    cloneFail('Tool call structure carries more than ' + limits.maxTotalChars + ' string chars.');
+  }
+  const byteRoom = Math.min(limits.maxStringBytes, limits.maxTotalBytes - state.bytes);
+  const bytes = utf8ByteLength(text, byteRoom);
+  if (bytes > limits.maxStringBytes) {
+    cloneFail(label + ' is ' + bytes + ' bytes, above the hard argument cap of ' + limits.maxStringBytes + '.');
+  }
+  if (state.bytes + bytes > limits.maxTotalBytes) {
+    cloneFail('Tool call structure carries more than ' + limits.maxTotalBytes + ' string bytes.');
+  }
+  state.chars += text.length;
+  state.bytes += bytes;
+  if (scalar) {
+    state.strings += 1;
+    if (state.strings > limits.maxStrings) cloneFail('Tool call structure has more than ' + limits.maxStrings + ' scalar values.');
+  }
+}
+
+function countCloneKey(state) {
+  state.keys += 1;
+  if (state.keys > state.limits.maxKeys) cloneFail('Tool call structure has more than ' + state.limits.maxKeys + ' enumerable keys.');
+}
+
+function cloneKey(input, key, copy, state, depth) {
+  if (typeof key === 'string') chargeCloneString(key, state, 'Object key', false);
+  const value = cloneValue(input[key], state, depth + 1);
+  Object.defineProperty(copy, key, { value, enumerable: true, writable: false, configurable: false });
+}
+
+function cloneValue(value, state, depth) {
+  if (typeof value === 'string') {
+    chargeCloneString(value, state, 'Argument string', true);
+    return value;
+  }
+  if (!value || typeof value !== 'object') return value;
+  if (depth > state.limits.maxDepth) cloneFail('Tool call structure is nested deeper than ' + state.limits.maxDepth + ' levels.');
+  if (state.active.has(value)) cloneFail('Tool call structure contains a cycle.');
+  state.active.add(value);
+  const copy = Array.isArray(value) ? [] : Object.create(null);
+  try {
+    for (const key in value) {
+      countCloneKey(state);
+      if (Object.hasOwn(value, key)) cloneKey(value, key, copy, state, depth);
+    }
+    for (const key of Object.getOwnPropertySymbols(value)) {
+      countCloneKey(state);
+      if (Object.prototype.propertyIsEnumerable.call(value, key)) cloneKey(value, key, copy, state, depth);
+    }
+  } finally {
+    state.active.delete(value);
+  }
+  return Object.freeze(copy);
+}
+
+function cloneWithLimits(value, limits) {
+  const state = { limits, keys: 0, strings: 0, chars: 0, bytes: 0, active: new Set() };
+  return cloneValue(value, state, -1);
+}
+
+function cloneFrozen(value) {
+  return cloneWithLimits(value, INPUT_CLONE_LIMITS);
+}
+
+function cloneGeneratedFrozen(value) {
+  return cloneWithLimits(value, GENERATED_CLONE_LIMITS);
+}
+
+function frozenEmptyObject() {
+  return Object.freeze(Object.create(null));
+}
+
+function budgetVerdict(message) {
+  const finding = Object.freeze({ rule: 'budgetExceeded', severity: 'critical', message, action: 'deny' });
+  const matched = Object.freeze({ rule: 'budgetExceeded', action: 'deny' });
+  return Object.freeze({
+    decision: 'deny',
+    risk: 100,
+    findings: Object.freeze([finding]),
+    matched: Object.freeze([matched]),
+    provenance: frozenEmptyObject(),
+    details: frozenEmptyObject(),
+    effect: 'unknown'
+  });
+}
+
+function fallbackCall(input) {
+  const tool = input && typeof input === 'object' && typeof input.tool === 'string' ? input.tool.slice(0, 160) : '';
+  const call = Object.create(null);
+  Object.defineProperty(call, 'tool', { value: tool, enumerable: true, writable: false, configurable: false });
+  Object.defineProperty(call, 'args', { value: frozenEmptyObject(), enumerable: true, writable: false, configurable: false });
+  return Object.freeze(call);
+}
+
+function snapshotCall(input) {
+  try {
+    return { call: cloneFrozen(input), verdict: null };
+  } catch (error) {
+    if (!error || error.rule !== 'budgetExceeded') throw error;
+    return { call: fallbackCall(input), verdict: budgetVerdict(error.message) };
+  }
+}
+
 /**
  * Validates and normalizes a policy object. Unknown keys are errors; missing
  * rule actions fall back to the strictest action so a gap never opens a hole.
@@ -268,19 +429,46 @@ function scanUntrustedSource(key, text) {
   return scan;
 }
 
-function normalizeQuotaCounts(raw) {
+function normalizeQuotaCounts(raw, policy) {
   if (raw === undefined || raw === null) return null;
   const entries = raw instanceof Map ? raw.entries() : (Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.entries(raw) : []));
+  const configuredTools = policy && policy.tools && typeof policy.tools === 'object' ? policy.tools : {};
   const counts = new Map();
   for (const entry of entries) {
     if (!Array.isArray(entry)) continue;
     const [tool, value] = entry;
     const count = Number(value);
-    if (typeof tool !== 'string' || !Number.isFinite(count) || count <= 0) continue;
+    if (typeof tool !== 'string' || !hasOwn(configuredTools, tool) || !Number.isFinite(count) || count <= 0) continue;
     counts.set(tool, (counts.get(tool) || 0) + Math.floor(count));
   }
   return counts;
 }
+
+function hasOwnProtoKey(value) {
+  return Boolean(value && (typeof value === 'object' || typeof value === 'function') && hasOwn(value, '__proto__'));
+}
+
+function containsOwnProtoKey(value, state = { keys: 0, active: new Set() }, depth = 0) {
+  if (!value || (typeof value !== 'object' && typeof value !== 'function')) return false;
+  if (hasOwnProtoKey(value)) return true;
+  if (depth >= 8 || state.active.has(value)) return true;
+  state.keys += 1;
+  if (state.keys > 128) return true;
+  state.active.add(value);
+  try {
+    for (const key of Object.keys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor && hasOwn(descriptor, 'value') && containsOwnProtoKey(descriptor.value, state, depth + 1)) return true;
+    }
+  } catch {
+    return true;
+  } finally {
+    state.active.delete(value);
+  }
+  return false;
+}
+
+const PROTO_KEY_CONTEXT_MESSAGE = 'Context object contains an own __proto__ key.';
 
 /**
  * Prepares a context once so many calls can be checked cheaply.
@@ -292,11 +480,17 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
   const budgetExceeded = [];
   const note = (reason) => { if (!budgetExceeded.includes(reason)) budgetExceeded.push(reason); };
 
+  const contextHasProtoKey = hasOwnProtoKey(context)
+    || [context.trusted, context.untrusted, context.secrets, context.history, context.quotaCounts].some(hasOwnProtoKey);
+  if (contextHasProtoKey) note(PROTO_KEY_CONTEXT_MESSAGE);
   const rawHistory = Array.isArray(context.history) ? context.history : [];
   const history = rawHistory.slice(-256);
   const historyOverCap = rawHistory.length > 256;
   if (historyOverCap) note('Retained tool-call history exceeds 256 entries.');
-  const quotaCounts = normalizeQuotaCounts(context.quotaCounts);
+  const retainedHistoryHasProtoKey = !historyOverCap && history.some((entry) => containsOwnProtoKey(entry));
+  if (retainedHistoryHasProtoKey) note(PROTO_KEY_CONTEXT_MESSAGE);
+  const rejectContext = contextHasProtoKey || retainedHistoryHasProtoKey;
+  const quotaCounts = rejectContext ? null : normalizeQuotaCounts(context.quotaCounts, policy);
 
   let contextItems = 0;
   let retainedChars = 0;
@@ -324,16 +518,24 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
   };
 
   const trustedParts = [];
-  for (const value of historyOverCap ? [] : (Array.isArray(context.trusted) ? context.trusted : [])) {
+  for (const value of (historyOverCap || rejectContext) ? [] : (Array.isArray(context.trusted) ? context.trusted : [])) {
     if (!takeContextItem()) break;
+    if (containsOwnProtoKey(value)) {
+      note(PROTO_KEY_CONTEXT_MESSAGE);
+      continue;
+    }
     trustedParts.push(retain(value, 'trusted context').text);
   }
   const trustedText = trustedParts.join('\n');
 
   const sources = [];
-  const rawSources = historyOverCap ? [] : (Array.isArray(context.untrusted) ? context.untrusted : []);
+  const rawSources = (historyOverCap || rejectContext) ? [] : (Array.isArray(context.untrusted) ? context.untrusted : []);
   for (const [i, input] of rawSources.entries()) {
     if (!takeContextItem()) break;
+    if (containsOwnProtoKey(input)) {
+      note(PROTO_KEY_CONTEXT_MESSAGE);
+      continue;
+    }
     const src = input && typeof input === 'object' ? input : { text: input };
     const trust = src.trust === 'internal' ? 'internal' : 'untrusted';
     if (trust === 'internal' && policy.trustInternal) continue;
@@ -353,8 +555,12 @@ export function prepareContext(context = {}, policy = PRESETS.balanced) {
 
   const secrets = [];
   const seenSecrets = new Set();
-  for (const input of historyOverCap ? [] : (Array.isArray(context.secrets) ? context.secrets : [])) {
+  for (const input of (historyOverCap || rejectContext) ? [] : (Array.isArray(context.secrets) ? context.secrets : [])) {
     if (!takeContextItem()) break;
+    if (containsOwnProtoKey(input)) {
+      note(PROTO_KEY_CONTEXT_MESSAGE);
+      continue;
+    }
     const value = String(input);
     if (value.length < 8 || seenSecrets.has(value)) continue;
     seenSecrets.add(value);
@@ -443,10 +649,13 @@ export function extractSecrets(text) {
 // After a tool runs, its output becomes context: secrets from sensitive reads are
 // remembered, and anything fetched from the outside becomes untrusted content.
 export function learnFromResult(call, result, context, policy = PRESETS.balanced) {
+  const base = context && typeof context === 'object' ? context : {};
+  const list = (value) => Array.isArray(value) ? [...value] : [];
   const next = appendHistoryEntry({
-    trusted: [...(context.trusted || [])],
-    untrusted: [...(context.untrusted || [])],
-    secrets: [...(context.secrets || [])]
+    ...base,
+    trusted: list(base.trusted),
+    untrusted: list(base.untrusted),
+    secrets: list(base.secrets)
   }, call.tool);
   const text = typeof result === 'string' ? result : JSON.stringify(result ?? '');
   const spec = TOOL_CATALOG[call.tool];
@@ -512,6 +721,40 @@ function markdownFindings(markdown, ctx, policy) {
   return out;
 }
 
+const SHELL_OPERATOR_PATTERN = /[;|&`]|\$\(|\n/;
+const MIN_OPERATOR_WITNESS = 6;
+
+function shellOperatorWitness(text, haystack, trustedLower) {
+  const x = String(text).slice(0, 4000);
+  const y = String(haystack).slice(0, 4000);
+  if (x.length < MIN_OPERATOR_WITNESS || y.length < MIN_OPERATOR_WITNESS) return '';
+  const positions = new Map();
+  for (let j = 0; j + MIN_OPERATOR_WITNESS <= y.length; j += 1) {
+    const key = y.slice(j, j + MIN_OPERATOR_WITNESS);
+    if (!positions.has(key)) positions.set(key, j);
+  }
+  for (let i = 0; i + MIN_OPERATOR_WITNESS <= x.length; i += 1) {
+    const witness = x.slice(i, i + MIN_OPERATOR_WITNESS);
+    if (!SHELL_OPERATOR_PATTERN.test(witness)) continue;
+    const yFirst = positions.get(witness);
+    if (yFirst === undefined || trustedLower.includes(witness)) continue;
+    let start = i;
+    let end = i + MIN_OPERATOR_WITNESS;
+    let yStart = yFirst;
+    let yEnd = yFirst + MIN_OPERATOR_WITNESS;
+    while (start > 0 && yStart > 0 && x[start - 1] === y[yStart - 1]) {
+      start -= 1;
+      yStart -= 1;
+    }
+    while (end < x.length && yEnd < y.length && x[end] === y[yEnd]) {
+      end += 1;
+      yEnd += 1;
+    }
+    return x.slice(start, end);
+  }
+  return '';
+}
+
 function shellFindings(cmd, ctx, work = null) {
   const analysis = analyzeShell(cmd);
   const out = [...analysis.findings];
@@ -538,8 +781,8 @@ function shellFindings(cmd, ctx, work = null) {
           budgetFull = true;
           break;
         }
-        const run = longestCommonString(textLower, src.haystack);
-        if (run.length >= 6 && /[;|&`]|\$\(|\n/.test(run) && !ctx.trustedLower.includes(run)) {
+        const run = shellOperatorWitness(textLower, src.haystack, ctx.trustedLower);
+        if (run) {
           hit = { rule: 'shellMetaFromUntrusted', severity: 'critical', message: `Shell operators came from ${src.origin}: "${run.trim().slice(0, 60)}".` };
           break;
         }
@@ -553,7 +796,7 @@ function shellFindings(cmd, ctx, work = null) {
 
 function argFindings(tool, spec, args, ctx, policy, work = null) {
   const findings = [];
-  const details = {};
+  const details = Object.create(null);
   for (const [name, kind] of Object.entries(spec.args)) {
     const value = args[name];
     if (value === undefined || value === null || value === '') continue;
@@ -628,7 +871,9 @@ function argFindings(tool, spec, args, ctx, policy, work = null) {
  */
 export function evaluateCall(call, context = {}, policy = PRESETS.balanced) {
   try {
-    return evaluateCallUnsafe(call, context, policy);
+    const snapshot = snapshotCall(call);
+    if (snapshot.verdict) return snapshot.verdict;
+    return evaluateCallUnsafe(snapshot.call, context, policy);
   } catch (error) {
     return {
       decision: 'deny',
@@ -710,7 +955,7 @@ function evaluateCallUnsafe(call, rawContext, policy) {
   findings.push(...argF);
 
   // Taint: which argument values were copied from untrusted content?
-  const provenance = {};
+  const provenance = Object.create(null);
   for (const name of Object.keys(spec.args)) {
     const value = args[name];
     if (typeof value !== 'string' || !value) continue;

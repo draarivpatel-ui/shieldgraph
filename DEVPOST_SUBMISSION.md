@@ -4,11 +4,11 @@ Track. AI, Agentic Systems, Cybersecurity, and Dev Tools
 
 ## Elevator pitch
 
-A browser-native firewall for AI agent tool calls. It traces where every argument came from, decodes hidden payloads, and compiles your policy into middleware you can run.
+A browser-native firewall for AI agent tool calls. It checks arguments for untrusted text-match evidence, labels unmatched arguments `origin not established`, decodes hidden payloads, and compiles your policy into middleware you can run.
 
 ## Inspiration
 
-AI agents now read web pages, emails, READMEs and tool output, then act with real tools like a shell, an HTTP client, an inbox or a payment API. That makes indirect prompt injection a security problem rather than a chatbot quirk. A poisoned README can tell a coding agent to pipe a remote script into bash. An email can ask an inbox assistant to wire money. A webhook can point an agent at the cloud metadata address. Most guardrails look at the model's text. ShieldGraph looks at the tool call, the moment the agent touches the world, and asks where each argument came from.
+AI agents now read web pages, emails, READMEs and tool output, then act with real tools like a shell, an HTTP client, an inbox or a payment API. That makes indirect prompt injection a security problem rather than a chatbot quirk. A poisoned README can tell a coding agent to pipe a remote script into bash. An email can ask an inbox assistant to wire money. A webhook can point an agent at the cloud metadata address. Most guardrails look at the model's text. ShieldGraph looks at the tool call, the moment the agent touches the world, and asks whether each argument carries untrusted text it should not.
 
 ## What it does
 
@@ -37,7 +37,7 @@ ShieldGraph is plain JavaScript ES modules, HTML and CSS with zero dependencies,
 
 The flow graph is hand-built SVG, the display face ShieldGraph Plot is a monoline font drawn stroke by stroke with a Python script, and the page runs under a strict Content Security Policy with no inline script and no markup ever built from payload text.
 
-Testing covers 290 Node unit tests (including bypass attempts, benign false-positive cases, guard parity, WCAG contrast computed from the real color tokens, and a scanner that proves itself on planted probes) plus a headless Chrome audit at desktop, tablet and phone sizes that clicks through every view, runs the fuzzer and an XSS payload, downloads the guard and runs it in Node, and checks the audit sheet prints on exactly one US Letter page.
+Testing covers 314 Node unit tests (including bypass attempts, benign false-positive cases, guard parity, WCAG contrast computed from the real color tokens, and a scanner that proves itself on planted probes) plus a headless Chrome audit at desktop, tablet and phone sizes that clicks through every view, runs the fuzzer and an XSS payload, downloads the guard and runs it in Node, and checks the audit sheet prints on exactly one US Letter page.
 
 ## Challenges we ran into
 

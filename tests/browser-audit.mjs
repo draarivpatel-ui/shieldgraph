@@ -5,7 +5,6 @@
 //   node tests/browser-audit.mjs            (CHROME_PATH and CDP_TIMEOUT_MS optional)
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -15,8 +14,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const chromePath = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const TIMEOUT = Number(process.env.CDP_TIMEOUT_MS || 45000);
 const shotsDir = path.join(root, 'docs', 'screenshots');
-const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'shieldgraph-audit-'));
-const profileDir = path.join(tmpRoot, 'profile');
+const tmpRoot = '/private/tmp/agent-work/l1039-shieldgraph';
+fs.rmSync(tmpRoot, { recursive: true, force: true });
+const profileDir = tmpRoot;
 const downloadDir = path.join(tmpRoot, 'downloads');
 fs.mkdirSync(downloadDir, { recursive: true });
 fs.mkdirSync(shotsDir, { recursive: true });
@@ -327,6 +327,10 @@ async function main() {
     check('markdown beacon in the playground is Blocked', /Blocked/.test(await text('#pg-verdict')));
     await setField('#pg-args', '{ "markdown": ');
     check('invalid argument JSON shows an error and fails closed', /not valid JSON/.test(await text('#pg-args-err')) && !/Allowed/.test(await text('#pg-verdict')));
+    await cdp.eval(`(() => { const s = document.getElementById('pg-tool'); s.value = 'read_file'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+    await setField('#pg-args', '{"path":"a.txt","toString":"copied","constructor":"built","__proto__":{"polluted":true}}');
+    const protoTrace = await text('#pg-text-trace-body');
+    check('text trace renders prototype-named denied arguments without throwing', /-> toString/.test(protoTrace) && /-> constructor/.test(protoTrace) && /origin not established/.test(protoTrace) && /Blocked/.test(await text('#pg-verdict')), protoTrace.slice(0, 120));
 
     // Policy editor: invalid JSON keeps the last policy; rule edit applies Custom.
     await click('#tab-policy');

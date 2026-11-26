@@ -810,11 +810,141 @@ test('over-cap history is rejected before untrusted sources are scanned', () => 
   assert.ok(ctx.budgetExceeded.some((m) => m.includes('history')));
 });
 
-test('shell operator taint uses the deterministic earliest equal-length match', () => {
+test('direct evaluation applies the same hard snapshot limits before schema validation', () => {
+  const oversized = { tool: 'shell_exec', args: { cmd: `echo ${'x'.repeat(WORK_LIMITS.maxArgumentChars + 1)}` } };
+  const byteHeavy = { tool: 'shell_exec', args: { cmd: `echo ${String.fromCodePoint(0x4e2d).repeat(12000)}` } };
+  let deepValue = { end: true };
+  for (let i = 0; i < 14; i += 1) deepValue = { next: deepValue };
+  const deep = { tool: 'read_file', args: { path: 'src/app.ts', extra: deepValue } };
+  const keyArgs = { path: 'src/app.ts' };
+  for (let i = 0; i < 300; i += 1) keyArgs[`k${i}`] = 'x';
+  const keyHeavy = { tool: 'read_file', args: keyArgs };
+  const totalHeavy = { tool: 'read_file', args: { path: 'src/app.ts', extra: Array.from({ length: 6 }, () => 'x'.repeat(12000)) } };
+  const cyclicArgs = { path: 'src/app.ts' };
+  cyclicArgs.self = cyclicArgs;
+  const cyclic = { tool: 'read_file', args: cyclicArgs };
+  for (const [label, input] of [['oversized', oversized], ['byte-heavy', byteHeavy], ['deep', deep], ['key-heavy', keyHeavy], ['total-heavy', totalHeavy], ['cyclic', cyclic]]) {
+    const r = decide(input);
+    assert.equal(r.decision, 'deny', label);
+    assert.ok(rules(r).includes('budgetExceeded'), label);
+  }
+});
+
+test('direct evaluation rejects an own __proto__ key inside a context object', () => {
+  const source = JSON.parse('{"__proto__":{"polluted":true},"origin":"page","text":"ordinary text"}');
+  const r = decide({ tool: 'read_file', args: { path: 'src/app.ts' } }, { untrusted: [source] });
+  assert.equal(r.decision, 'deny');
+  assert.ok(rules(r).includes('budgetExceeded'));
+});
+
+test('compiled guard context entries reject own __proto__ keys and context snapshots are deeply frozen', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const source = JSON.parse('{"__proto__":{"polluted":true},"origin":"page","text":"ordinary text"}');
+  const verdict = mod.checkToolCall({ tool: 'read_file', args: { path: 'src/app.ts' } }, { untrusted: [source] });
+  assert.equal(verdict.decision, 'deny');
+  assert.ok(verdict.findings.some((f) => f.rule === 'budgetExceeded'));
+
+  const guard = mod.createGuard();
+  guard.addUntrusted('ordinary page text', 'page');
+  const snapshot = guard.context;
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.untrusted), true);
+  assert.equal(Object.isFrozen(snapshot.untrusted[0]), true);
+  assert.throws(() => { snapshot.untrusted[0].text = 'changed'; }, TypeError);
+  assert.throws(() => { snapshot.history.push({ tool: 'read_file' }); }, TypeError);
+});
+
+test('compiled guard run rejects an own __proto__ key nested in context before execution', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const guard = mod.createGuard();
+  const badOrigin = JSON.parse('{"__proto__":{"polluted":true}}');
+  guard.addUntrusted('ordinary page text', badOrigin);
+  let runs = 0;
+  const blocked = await rejectionOf(guard.run({ tool: 'read_file', args: { path: 'src/app.ts' } }, () => { runs += 1; }));
+  assert.equal(blocked.name, 'ShieldGraphBlocked');
+  assert.equal(blocked.verdict.decision, 'deny');
+  assert.ok(blocked.verdict.findings.some((f) => f.rule === 'budgetExceeded'));
+  assert.equal(runs, 0);
+});
+
+test('three successful results preserve three history entries in direct learning', () => {
+  let context = { trusted: [], untrusted: [], secrets: [], history: [] };
+  for (let i = 0; i < 3; i += 1) {
+    context = learnFromResult({ tool: 'http_get', args: { url: `https://docs.python.org/3/?n=${i}` } }, `page ${i}`, context, balanced);
+  }
+  assert.equal(context.history.length, 3);
+  assert.deepEqual(context.history.map((h) => h.tool), ['http_get', 'http_get', 'http_get']);
+});
+
+test('three successful guard runs preserve three history entries', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const guard = mod.createGuard();
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal(await guard.run({ tool: 'http_get', args: { url: `https://docs.python.org/3/?n=${i}` } }, () => `page ${i}`), `page ${i}`);
+  }
+  assert.equal(guard.context.history.length, 3);
+  assert.deepEqual(guard.context.history.map((h) => h.tool), ['http_get', 'http_get', 'http_get']);
+});
+
+test('replay enforces a tool quota after more than 256 filler history entries trim the first call', () => {
+  const raw = clonePolicy(PRESETS.balanced);
+  raw.tools.read_file.maxCalls = 1;
+  raw.tools.http_get.maxCalls = 400;
+  raw.rules.rateLimit = 'deny';
+  const policy = validatePolicy(raw).policy;
+  const nodes = [
+    { id: 'u1', kind: 'user', label: 'User prompt', text: 'read one source file' },
+    { id: 't0', kind: 'tool', tool: 'read_file', args: { path: 'src/app.ts' }, from: ['u1'], truth: 'benign', result: 'ok' }
+  ];
+  for (let i = 0; i < 300; i += 1) {
+    nodes.push({ id: `f${i}`, kind: 'tool', tool: 'http_get', args: { url: `https://docs.python.org/3/?n=${i}` }, from: ['u1'], truth: 'benign', result: 'ok' });
+  }
+  nodes.push({ id: 'final', kind: 'tool', tool: 'read_file', args: { path: 'src/app.ts' }, from: ['u1'], truth: 'benign' });
+  const run = analyzeScenario({ id: 'quota-replay', label: 'benign', title: 'Quota replay', category: 'Regression', summary: '', nodes }, policy);
+  const final = run.nodes.find((n) => n.id === 'final');
+  assert.equal(final.decision, 'deny');
+  assert.ok(final.findings.some((f) => f.rule === 'rateLimit'));
+});
+
+test('compiled quota maps ignore 500 distinct unknown tool names', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const guard = mod.createGuard();
+  for (let i = 0; i < 500; i += 1) {
+    const blocked = await rejectionOf(guard.run({ tool: `attacker_tool_${i}`, args: {} }, () => { throw new Error('must not execute'); }));
+    assert.equal(blocked.name, 'ShieldGraphBlocked');
+    assert.ok(blocked.verdict.findings.some((f) => f.rule === 'unknownTool'));
+  }
+  assert.equal(guard.quotaCounts.size, 0);
+});
+
+test('shell operator taint denies an equal-length operator match hidden by a benign tie', () => {
   const r = decide(
     { tool: 'shell_exec', args: { cmd: 'do abcdef;zzzzz' } },
     { untrusted: [{ origin: 'page', text: 'x;zzzzz|abcdef' }] }
   );
-  assert.equal(r.decision, 'allow');
-  assert.ok(!rules(r).includes('shellMetaFromUntrusted'));
+  assert.equal(r.decision, 'deny');
+  assert.ok(rules(r).includes('shellMetaFromUntrusted'));
+  assert.ok(r.findings.find((f) => f.rule === 'shellMetaFromUntrusted').message.includes(';zzzzz'));
+});
+
+test('shell operator taint denies an operator match hidden by a longer benign overlap', () => {
+  const r = decide(
+    { tool: 'shell_exec', args: { cmd: 'do abcdefgh q;zzzzz' } },
+    { untrusted: [{ origin: 'page', text: 'abcdefgh|q;zzzzz' }] }
+  );
+  assert.equal(r.decision, 'deny');
+  assert.ok(rules(r).includes('shellMetaFromUntrusted'));
+});
+
+test('compiled guard and direct evaluation both deny the equal-length operator tie case', async () => {
+  const { mod } = await loadCompiled('balanced');
+  const call = { tool: 'shell_exec', args: { cmd: 'do abcdef;zzzzz' } };
+  const direct = decide(call, { untrusted: [{ origin: 'page', text: 'x;zzzzz|abcdef' }] });
+  const guard = mod.createGuard();
+  guard.addUntrusted('x;zzzzz|abcdef', 'page');
+  const compiled = guard.check(call);
+  assert.equal(direct.decision, 'deny');
+  assert.equal(compiled.decision, 'deny');
+  assert.ok(direct.findings.some((f) => f.rule === 'shellMetaFromUntrusted'));
+  assert.ok(compiled.findings.some((f) => f.rule === 'shellMetaFromUntrusted'));
 });

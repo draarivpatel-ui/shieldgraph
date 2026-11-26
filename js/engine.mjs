@@ -1,6 +1,6 @@
 // Trace engine: replays an agent trace step by step through the policy,
 // tracks taint provenance, and builds the flow graph plus benchmark metrics.
-import { PRESETS, PRESET_ORDER, TOOL_CATALOG, EFFECT_LABELS, validatePolicy, clonePolicy, prepareContext, evaluateCall, learnFromResult, appendHistoryEntry } from './policy.mjs';
+import { PRESETS, PRESET_ORDER, TOOL_CATALOG, EFFECT_LABELS, validatePolicy, clonePolicy, prepareContext, evaluateCall, learnFromResult, appendHistoryEntry, recordQuotaCall } from './policy.mjs';
 import { scoreInjection } from './injection.mjs';
 import { deobfuscate } from './deobfuscate.mjs';
 import { actionRank } from './util.mjs';
@@ -20,6 +20,7 @@ const EXECUTED = new Set(['allow', 'log']);
  */
 export function analyzeScenario(scenario, policy) {
   let context = { trusted: [], untrusted: [], secrets: [], history: [] };
+  const quotaCounts = new Map();
   const nodes = [];
   const calls = [];
   for (const node of scenario.nodes) {
@@ -38,7 +39,7 @@ export function analyzeScenario(scenario, policy) {
       if (out.tainted) out.taint = [node.id];
       out.status = out.tainted ? (injection.score >= policy.injectionThreshold ? 'hostile' : 'untrusted') : 'internal';
     } else if (node.kind === 'tool') {
-      const ctx = prepareContext(context, policy);
+      const ctx = prepareContext({ ...context, quotaCounts }, policy);
       const res = evaluateCall({ tool: node.tool, args: node.args }, ctx, policy);
       out.result = node.result;
       out.decision = res.decision;
@@ -59,6 +60,7 @@ export function analyzeScenario(scenario, policy) {
         if (d.changed.length) out.argDeob[k] = { before: v, after: d.text, layers: d.layers.filter((l) => l.count).map(({ id, label, count }) => ({ id, label, count })), payloads: d.payloads.map(({ kind, decoded }) => ({ kind, decoded })) };
       }
       calls.push({ scenario: scenario.id, nodeId: node.id, tool: node.tool, truth: node.truth, decision: res.decision, risk: res.risk, findings: res.findings });
+      recordQuotaCall(quotaCounts, node.tool, policy);
       if (EXECUTED.has(res.decision) && node.result !== undefined) {
         context = learnFromResult({ tool: node.tool, args: node.args }, node.result, context, policy);
       } else {
