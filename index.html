@@ -83,6 +83,10 @@
       </div>
       <div class="graph-wrap">
         <div class="graph" id="graph" role="group" aria-label="Taint and tool-call flow graph"></div>
+        <details class="text-trace" id="text-trace">
+          <summary>Text trace</summary>
+          <div class="text-trace-body" id="text-trace-body"></div>
+        </details>
       </div>
       <div class="transport" role="group" aria-label="Trace playback">
         <button type="button" class="icon-btn" id="step-reset" aria-label="Show the whole trace"><svg aria-hidden="true"><use href="#i-reset"/></svg></button>
@@ -162,6 +166,10 @@
     <div class="pg-result" aria-live="polite">
       <div class="pg-verdict" id="pg-verdict"></div>
       <div class="graph graph-mini" id="pg-graph" role="group" aria-label="Playground flow graph"></div>
+      <details class="text-trace">
+        <summary>Text trace</summary>
+        <div class="text-trace-body" id="pg-text-trace-body"></div>
+      </details>
       <div id="pg-detail"></div>
     </div>
   </section>
@@ -171,10 +179,19 @@
     <div class="table-scroll">
       <table class="metrics" id="metrics-table">
         <caption>Per tool call, across all 14 scenarios. Intercepted means blocked or held for human approval.</caption>
-        <thead><tr><th scope="col">Policy</th><th scope="col">Malicious caught</th><th scope="col">Benign interrupted</th><th scope="col">Precision</th><th scope="col">Recall</th><th scope="col">F1</th><th scope="col">False positive rate</th></tr></thead>
+        <thead><tr><th scope="col">Policy</th><th scope="col">Malicious caught</th><th scope="col">Benign interrupted</th><th scope="col">Precision</th><th scope="col">Recall</th><th scope="col">F1</th><th scope="col">False positive rate</th><th scope="col">Denied</th><th scope="col">Held for approval</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
+    <section class="misses" aria-labelledby="misses-h">
+      <h2 id="misses-h">Known misses and holdout notes</h2>
+      <p>The corpus is written by the same author as the detectors, so it is a coverage check rather than an independent holdout set. The perfect Balanced score means these attack shapes are covered, not that the detector generalizes.</p>
+      <ul>
+        <li>Ordinary source code can still be exfiltrated to an allowlisted host when no learned secret or credential shape is present.</li>
+        <li>A command assembled with <code>printf</code> can hide the network tool name from static shell analysis.</li>
+        <li>DNS rebinding is invisible because the guard never resolves hostnames. A production deployment needs a resolving egress proxy.</li>
+      </ul>
+    </section>
     <h2>Decision matrix</h2>
     <div class="table-scroll">
       <table class="matrix" id="matrix-table">

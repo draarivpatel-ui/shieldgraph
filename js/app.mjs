@@ -1,7 +1,7 @@
 // ShieldGraph workbench UI.
 import { SCENARIOS, getScenario } from './scenarios.mjs';
 import { analyzeScenario, presetPolicy, runBenchmark } from './engine.mjs';
-import { PRESET_ORDER, RULES, TOOL_CATALOG, validatePolicy, clonePolicy } from './policy.mjs';
+import { PRESET_ORDER, RULES, TOOL_CATALOG, EFFECT_LABELS, validatePolicy, clonePolicy } from './policy.mjs';
 import { compileGuard, loadGuardSources, stableStringify, sha256Hex } from './compiler.mjs';
 import { renderGraph, STATUS_TEXT, STATUS_ICON } from './graph.mjs';
 import { renderReport } from './report.mjs';
@@ -231,7 +231,7 @@ function renderList() {
       return h('li', {},
         h('button', {
           type: 'button', class: 'scn', 'data-id': s.id, 'aria-current': current ? 'true' : null,
-          onclick: () => selectScenario(s.id)
+          onclick: () => selectScenario(s.id, true)
         },
         icon(STATUS_ICON[run.verdict], `ico s-${run.verdict}`),
         h('span', { class: 'scn-t' }, s.title),
@@ -269,6 +269,37 @@ function initListKeys() {
   });
 }
 
+function oneLine(value, max = 90) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function renderTextTrace(run, target) {
+  const tools = run.nodes.filter((n) => n.kind === 'tool');
+  const items = tools.map((node) => {
+    const effect = EFFECT_LABELS[node.effect] || 'Unknown effect';
+    const outcome = `${effect} ${node.decision === 'allow' || node.decision === 'log' ? 'reached' : 'not reached'} (${STATUS_TEXT[node.decision]})`;
+    const args = Object.entries(node.args || {}).map(([arg, value]) => {
+      const trace = node.provenance && node.provenance[arg];
+      let source = 'trusted user or planner input';
+      if (trace && trace.sources.length) {
+        const seen = trace.sources.map((s) => `${s.origin} (${s.how})`).join(' or ');
+        source = trace.endorsed ? `user-endorsed value also seen in ${seen}` : seen;
+      }
+      const matched = node.findings.filter((f) => !f.arg || f.arg === arg).map((f) => f.rule);
+      const rulesText = matched.length ? matched.join(', ') : 'no rule matched';
+      const shown = oneLine(value);
+      return h('li', {}, `${source} -> ${arg}${shown ? ` "${shown}"` : ''} -> ${rulesText} -> ${outcome}`);
+    });
+    return h('li', {},
+      h('div', { class: 'trace-tool' }, h('code', {}, `${node.id} ${node.tool}`), badge(node.decision, 'badge-sm')),
+      h('ul', { class: 'trace-args' }, args));
+  });
+  target.replaceChildren(items.length
+    ? h('ol', { class: 'trace-list' }, items)
+    : h('p', { class: 'muted' }, 'No tool calls in this trace.'));
+}
+
 function renderStage(run) {
   const s = run.scenario;
   $('#scn-title').textContent = s.title;
@@ -283,6 +314,7 @@ function renderStage(run) {
   ];
   $('#scn-facts').replaceChildren(...facts.flatMap(([k, v]) => [h('dt', {}, k), h('dd', {}, v)]));
   renderGraph($('#graph'), run, { step: state.step, selectedId: state.selectedId, onSelect: selectNode });
+  renderTextTrace(run, $('#text-trace-body'));
   const total = run.nodes.length;
   const shown = state.step == null ? total : state.step;
   const at = state.step == null ? null : run.nodes[state.step - 1];
@@ -472,6 +504,7 @@ function renderPlayground() {
     h('div', { class: 'insp-row' }, badge(call.decision, 'badge-lg'), meter(call.risk)),
     h('p', { class: 'pg-policy' }, `Policy ${LABELS[state.presetId]}`));
   renderGraph($('#pg-graph'), run, { interactive: false });
+  renderTextTrace(run, $('#pg-text-trace-body'));
   const parts = [h('h3', {}, 'Matched rules'), findingsTable(call.findings)];
   const lineage = Object.entries(call.provenance || {});
   parts.push(h('h3', {}, 'Taint lineage'));
@@ -528,7 +561,9 @@ function renderBenchmark() {
       h('td', { class: 'num' }, m.precision.toFixed(2)),
       h('td', { class: 'num' }, m.recall.toFixed(2)),
       h('td', { class: 'num' }, h('strong', {}, m.f1.toFixed(2))),
-      h('td', { class: 'num' }, `${(m.fpr * 100).toFixed(0)}%`));
+      h('td', { class: 'num' }, `${(m.fpr * 100).toFixed(0)}%`),
+      h('td', { class: 'num' }, String(bench[k].blocked)),
+      h('td', { class: 'num' }, String(bench[k].held)));
   }));
   $('#matrix-table thead').replaceChildren(h('tr', {},
     h('th', { scope: 'col' }, 'Scenario'), h('th', { scope: 'col' }, 'Call'), h('th', { scope: 'col' }, 'Truth'),

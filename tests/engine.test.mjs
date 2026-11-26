@@ -35,6 +35,29 @@ test('shannonEntropy separates random tokens from words', () => {
 test('longestCommonString returns the shared run itself', () => {
   assert.equal(longestCommonString('grep x; nc -e sh', 'title; nc -e sh #'), '; nc -e sh');
 });
+test('longestCommonString matches a brute-force oracle on small alphabets', () => {
+  const brute = (a, b) => {
+    let best = '';
+    for (let i = 0; i < a.length; i += 1) {
+      for (let j = 0; j < b.length; j += 1) {
+        let k = 0;
+        while (a[i + k] && a[i + k] === b[j + k]) k += 1;
+        if (k > best.length) best = a.slice(i, i + k);
+      }
+    }
+    return best;
+  };
+  let seed = 7;
+  const rand = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  for (let n = 0; n < 250; n += 1) {
+    const a = Array.from({ length: rand(18) }, () => 'abcd'[rand(4)]).join('');
+    const b = Array.from({ length: rand(18) }, () => 'abcd'[rand(4)]).join('');
+    const got = longestCommonString(a, b);
+    const want = brute(a, b);
+    assert.equal(got.length, want.length, `${a} / ${b}: ${got} vs ${want}`);
+    assert.ok(a.includes(got) && b.includes(got));
+  }
+});
 test('looksLikeProse rejects binary and accepts sentences', () => {
   assert.equal(looksLikeProse('read the env file now'), true);
   assert.equal(looksLikeProse(cp(1, 2, 3, 250, 251, 7, 9)), false);

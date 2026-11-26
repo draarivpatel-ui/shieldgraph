@@ -23,21 +23,21 @@ ShieldGraph replays an agent trace and draws it as a live flow graph with four c
 - **Benchmark.** Fourteen scenarios, ten attacks and four ordinary developer workflows, with every tool call labeled by hand. Switching between the Permissive, Balanced and Zero-Trust presets, or editing rules live, recomputes precision, recall, F1 and the false positive rate.
 - **Policy compiler.** Edit the JSON manifest or flip rule actions in a table, then export a runnable `shieldgraph-guard.mjs`, the policy JSON, and a one-page printable security audit sheet.
 
-| Policy | Malicious calls caught | Benign calls interrupted | Precision | Recall | F1 | False positive rate |
-| --- | --- | --- | --- | --- | --- | --- |
-| Permissive | 3/15 | 0/14 | 1.00 | 0.20 | 0.33 | 0% |
-| Balanced | 15/15 | 0/14 | 1.00 | 1.00 | 1.00 | 0% |
-| Zero-Trust | 15/15 | 8/14 | 0.65 | 1.00 | 0.79 | 57% |
+| Policy | Malicious calls caught | Benign calls interrupted | Precision | Recall | F1 | False positive rate | Denied | Held for approval |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Permissive | 3/15 | 0/14 | 1.00 | 0.20 | 0.33 | 0% | 3 | 0 |
+| Balanced | 15/15 | 0/14 | 1.00 | 1.00 | 1.00 | 0% | 14 | 1 |
+| Zero-Trust | 15/15 | 8/14 | 0.65 | 1.00 | 0.79 | 57% | 21 | 2 |
 
-The Balanced score is measured on scenarios written by the same author as the detectors, so it shows coverage of these attack shapes, not proof that it generalizes. Three attacks that Balanced misses today are pinned in the test suite and listed in the README.
+The Balanced score is measured on scenarios written by the same author as the detectors, so it shows coverage of these attack shapes, not proof that it generalizes. Three attacks that Balanced misses today are pinned in the test suite and listed in the README. Provenance matching and injection scoring are text heuristics, not cryptographic identity, sandboxing or OS-level authorization. The exported run() middleware binds each verdict to a frozen snapshot and reserves per-tool quota before asynchronous approval or execution, but the wrapped executor still has to be the only execution path.
 
 ## How we built it
 
-ShieldGraph is plain JavaScript ES modules, HTML and CSS with zero dependencies and zero network calls. The detectors are small pure modules (de-obfuscation, network, path, shell, injection) feeding one decision function, `evaluateCall`. The guard compiler concatenates those same modules into a single file and appends the policy and a small runtime, so the exported middleware and the on-screen verdicts come from identical code. A parity test imports the compiled guard for every preset and checks it against the engine on all 29 tool calls.
+ShieldGraph is plain JavaScript ES modules, HTML and CSS with zero dependencies, no external requests and no model calls. The browser fetches only same-origin static files, including the detector module sources needed to compile a guard export; guard and policy exports are generated locally as downloads. Node.js 22 or newer runs the test harness and generated middleware. The detectors are small pure modules (de-obfuscation, network, path, shell, injection) feeding one decision function, `evaluateCall`. The guard compiler concatenates those same modules into a single file and appends the policy and a small runtime, so the exported middleware and the on-screen verdicts come from identical code. A parity test imports the compiled guard for every preset and checks it against the engine on all 29 tool calls.
 
 The flow graph is hand-built SVG, the display face ShieldGraph Plot is a monoline font drawn stroke by stroke with a Python script, and the page runs under a strict Content Security Policy with no inline script and no markup ever built from payload text.
 
-Testing covers 276 Node unit tests (including bypass attempts, benign false-positive cases, guard parity, WCAG contrast computed from the real color tokens, and a scanner that proves itself on planted probes) plus a headless Chrome audit at desktop, tablet and phone sizes that clicks through every view, runs the fuzzer and an XSS payload, downloads the guard and runs it in Node, and checks the audit sheet prints on exactly one US Letter page.
+Testing covers 290 Node unit tests (including bypass attempts, benign false-positive cases, guard parity, WCAG contrast computed from the real color tokens, and a scanner that proves itself on planted probes) plus a headless Chrome audit at desktop, tablet and phone sizes that clicks through every view, runs the fuzzer and an XSS payload, downloads the guard and runs it in Node, and checks the audit sheet prints on exactly one US Letter page.
 
 ## Challenges we ran into
 

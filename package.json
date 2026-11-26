@@ -11,5 +11,5 @@
     "guard": "node tools/build-guard.mjs",
     "serve": "node tools/serve.mjs"
   },
-  "engines": { "node": ">=18" }
+  "engines": { "node": ">=22.0.0" }
 }

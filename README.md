@@ -2,7 +2,7 @@
 
 ShieldGraph is a firewall and red-team workbench for the tool calls an AI agent makes. It replays an agent trace (user prompt, untrusted content, planner, tool calls, effects), tracks where every argument came from, peels off the obfuscation attackers use, and decides whether each call is allowed, logged, held for a human, or blocked. The same decision code compiles into `shieldgraph-guard.mjs`, a zero-dependency middleware you can drop in front of a real agent's tool executor.
 
-Everything runs in the browser. No API keys, no model calls, no network requests, no build step, no dependencies.
+Everything runs in the browser. No API keys, no external requests or model calls, no build step, no dependencies. The browser fetches only same-origin static files, including the detector module sources needed to compile a guard export; guard and policy exports are generated locally as downloads.
 
 ![ShieldGraph workbench, light theme](docs/screenshots/desktop-workbench-light.png)
 
@@ -12,7 +12,7 @@ Everything runs in the browser. No API keys, no model calls, no network requests
 node tools/serve.mjs          # then open http://127.0.0.1:8737/
 ```
 
-Any static file server works. ES modules do not load from `file://`, so open it over HTTP.
+Node.js 22 or newer is required for the tests, guard build and generated middleware runtime. Any static file server works for the page. ES modules do not load from `file://`, so open it over HTTP.
 
 ## What it does
 
@@ -29,11 +29,11 @@ Any static file server works. ES modules do not load from `file://`, so open it 
 
 The corpus has 14 authored scenarios, 10 attacks and 4 ordinary workflows, with 29 tool calls labeled by hand (15 malicious, 14 benign). A call counts as intercepted when it is blocked or held for approval. These numbers are recomputed live in the Benchmark view, and `tests/policy.test.mjs` fails if this table drifts from them.
 
-| Policy | Malicious calls caught | Benign calls interrupted | Precision | Recall | F1 | False positive rate |
-| --- | --- | --- | --- | --- | --- | --- |
-| Permissive | 3/15 | 0/14 | 1.00 | 0.20 | 0.33 | 0% |
-| Balanced | 15/15 | 0/14 | 1.00 | 1.00 | 1.00 | 0% |
-| Zero-Trust | 15/15 | 8/14 | 0.65 | 1.00 | 0.79 | 57% |
+| Policy | Malicious calls caught | Benign calls interrupted | Precision | Recall | F1 | False positive rate | Denied | Held for approval |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Permissive | 3/15 | 0/14 | 1.00 | 0.20 | 0.33 | 0% | 3 | 0 |
+| Balanced | 15/15 | 0/14 | 1.00 | 1.00 | 1.00 | 0% | 14 | 1 |
+| Zero-Trust | 15/15 | 8/14 | 0.65 | 1.00 | 0.79 | 57% | 21 | 2 |
 
 Read the Balanced row with care. The scenarios and the detectors were written by the same person, so a perfect score on this set says the detectors cover these attack shapes, not that they generalize. No detector or policy source mentions a scenario id (a test enforces this), and `tests/policy.test.mjs` pins three attacks that Balanced misses today.
 
@@ -60,12 +60,13 @@ guard.addUntrusted(pageText, 'web page');     // anything fetched or received
 // Every tool call goes through run(). Denied calls throw ShieldGraphBlocked,
 // held calls wait for approve(), and results feed back into the context
 // (secrets read from credential files are remembered and stopped on the way out).
-const out = await guard.run({ tool: 'shell_exec', args: { cmd } }, (args) => exec(args.cmd));
+// The executor also receives the exact frozen call snapshot as its second argument.
+const out = await guard.run({ tool: 'shell_exec', args: { cmd } }, (args, frozenCall) => exec(args.cmd));
 ```
 
 Tool results feed back into the context. Files read with `read_file` count as internal content, which the Balanced preset trusts, so pass third-party files (a cloned repo's README, a downloaded PDF) through `guard.addUntrusted` yourself.
 
-The guard file is built by concatenating the exact detector modules the workbench runs, so the two cannot drift. A parity test imports the compiled guard for every preset and checks that it returns the same decision, risk and rule list as the engine for all 29 calls.
+The guard file is built by concatenating the exact detector modules the workbench runs, so the two cannot drift. A parity test imports the compiled guard for every preset and checks that it returns the same decision, risk and rule list as the engine for all 29 calls. Execution tests prove that allowed calls reach a mock executor, denied or rejected calls never do, held calls wait for the approval callback, and concurrent calls reserve per-tool quota before yielding.
 
 ## Scope and limits
 
@@ -75,6 +76,7 @@ ShieldGraph is deterministic static and taint analysis of recorded traces. It is
 - It does not read model reasoning. Taint comes from string provenance, so a planner that paraphrases an attacker's instruction into fresh words is caught only by the sink-side rules.
 - Injection scoring is pattern based. It is tuned to keep ordinary text ("ignore case differences", "user agent string") below threshold, and a determined attacker can write around it, which is why the sink rules carry most of the weight.
 - The scenarios use synthetic data, reserved `.example` domains and TEST-NET addresses. There is no production telemetry and no claim of real-world deployment.
+- Provenance matching and injection scoring are text heuristics, not cryptographic identity, sandboxing or OS-level authorization. `run()` is application-layer middleware: it binds each verdict to a frozen snapshot and reserves per-tool quota before asynchronous approval or execution, but it cannot defend a process that mutates memory or bypasses the wrapped executor.
 
 ## Tests
 

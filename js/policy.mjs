@@ -1,6 +1,6 @@
 // The policy evaluator. evaluateCall() is the single decision function used by
 // the workbench AND by the exported shieldgraph-guard.mjs, so both always agree.
-import { ACTIONS, actionRank, strictestAction, collectStrings, combineWeights, longestCommonString, shannonEntropy } from './util.mjs';
+import { ACTIONS, actionRank, strictestAction, collectStrings, combineWeights, longestCommonString, shannonEntropy, WORK_LIMITS, hasOwn, createWorkBudget, exceedBudget, reservePairwiseComparison } from './util.mjs';
 import { deobfuscate } from './deobfuscate.mjs';
 import { analyzeUrl, extractUrls, hostMatches } from './netguard.mjs';
 import { analyzePath, canonicalizePath, SENSITIVE_PATTERNS } from './pathguard.mjs';
@@ -17,8 +17,8 @@ export const TOOL_CATALOG = {
   browser_open: { effect: 'egress-read', privileged: false, args: { url: 'url' } },
   search_web: { effect: 'egress-read', privileged: false, args: { query: 'text' } },
   http_post: { effect: 'egress-write', privileged: true, args: { url: 'url', body: 'body' } },
-  send_email: { effect: 'comms', privileged: true, args: { to: 'recipient', subject: 'text', body: 'body' } },
-  transfer_funds: { effect: 'finance', privileged: true, args: { to_account: 'payee', amount: 'amount', memo: 'text' } },
+  send_email: { effect: 'comms', privileged: true, args: { to: 'recipient', subject: 'text', body: 'body' }, optional: ['subject'] },
+  transfer_funds: { effect: 'finance', privileged: true, args: { to_account: 'payee', amount: 'amount', memo: 'text' }, optional: ['memo'] },
   render_markdown: { effect: 'render', privileged: false, args: { markdown: 'markdown' } }
 };
 
@@ -38,6 +38,7 @@ export const RULES = {
   unknownTool: ['critical', 'Tool is not in the catalog; unknown tools fail closed.'],
   guardError: ['critical', 'The guard itself failed; failing closed.'],
   badArgs: ['high', 'Arguments are missing or not the expected type.'],
+  budgetExceeded: ['critical', 'Input or retained context exceeds the guard work budget.'],
   argCap: ['medium', 'An argument is longer than the policy cap.'],
   rateLimit: ['high', 'Tool exceeded its per-session call cap.'],
   ssrf: ['critical', 'Request targets a private, loopback or metadata address.'],
@@ -80,6 +81,7 @@ export const RULES = {
 export const SEVERITY_WEIGHT = { critical: 0.85, high: 0.5, medium: 0.2, low: 0.05, info: 0 };
 
 const RULE_IDS = Object.keys(RULES);
+const FAIL_CLOSED_RULES = new Set(['unknownTool', 'guardError', 'badArgs', 'budgetExceeded']);
 
 function severityDefaults(map) {
   const out = {};
@@ -207,7 +209,7 @@ export function validatePolicy(input) {
   if (typeof tools !== 'object' || Array.isArray(tools) || tools === null) errors.push('tools must be an object.');
   else {
     for (const [name, spec] of Object.entries(tools)) {
-      if (!TOOL_CATALOG[name]) {
+      if (!hasOwn(TOOL_CATALOG, name)) {
         errors.push(`tools.${name} is not a known tool.`);
         continue;
       }
@@ -229,14 +231,13 @@ export function validatePolicy(input) {
   if (typeof rules !== 'object' || Array.isArray(rules) || rules === null) errors.push('rules must be an object.');
   else {
     for (const [id, action] of Object.entries(rules)) {
-      if (!RULES[id]) errors.push(`rules.${id} is not a known rule.`);
+      if (!hasOwn(RULES, id)) errors.push(`rules.${id} is not a known rule.`);
       else if (!ACTIONS.includes(action)) errors.push(`rules.${id} must be one of ${ACTIONS.join(', ')}.`);
       else policy.rules[id] = action;
     }
   }
   for (const id of RULE_IDS) if (!policy.rules[id]) policy.rules[id] = 'deny';
-  policy.rules.unknownTool = policy.rules.unknownTool === 'allow' ? 'deny' : policy.rules.unknownTool;
-  policy.rules.guardError = 'deny';
+  for (const id of FAIL_CLOSED_RULES) policy.rules[id] = 'deny';
   return { ok: errors.length === 0, errors, policy: errors.length ? null : policy };
 }
 
@@ -246,42 +247,109 @@ function lower(s) {
   return String(s ?? '').toLowerCase();
 }
 
+const SOURCE_SCAN_CACHE = new WeakMap();
+
+function scanUntrustedSource(key, text) {
+  const canCache = key && (typeof key === 'object' || typeof key === 'function');
+  if (canCache) {
+    const cached = SOURCE_SCAN_CACHE.get(key);
+    if (cached && cached.text === text) return cached.scan;
+  }
+  const injection = scoreInjection(text);
+  const scan = { injection, haystack: lower(injection.deob.analysisText) };
+  if (canCache) SOURCE_SCAN_CACHE.set(key, { text, scan });
+  return scan;
+}
+
 /**
  * Prepares a context once so many calls can be checked cheaply.
  * context = { trusted: string[], untrusted: [{id, origin, text, trust?}], secrets: string[], history: [{tool}] }
+ * Retained input is capped before any detector runs. Oversized context is not
+ * silently trusted; the evaluator turns the budget marker into a fail-closed finding.
  */
 export function prepareContext(context = {}, policy = PRESETS.balanced) {
-  const trustedText = (context.trusted || []).map((t) => String(t ?? '')).join('\n');
+  const budgetExceeded = [];
+  const note = (reason) => { if (!budgetExceeded.includes(reason)) budgetExceeded.push(reason); };
+  let retainedItems = 0;
+  let retainedChars = 0;
+  const retain = (value, kind) => {
+    const original = String(value ?? '');
+    if (retainedItems >= WORK_LIMITS.maxContextItems) {
+      note(`Retained context has more than ${WORK_LIMITS.maxContextItems} items.`);
+      return null;
+    }
+    const room = Math.max(0, WORK_LIMITS.maxContextChars - retainedChars);
+    const allowed = Math.min(WORK_LIMITS.maxSourceChars, room);
+    let text = original;
+    let truncated = false;
+    if (text.length > allowed) {
+      truncated = true;
+      text = text.slice(0, allowed);
+      note(`Retained ${kind} exceeds the context size budget (${WORK_LIMITS.maxContextChars} chars total, ${WORK_LIMITS.maxSourceChars} chars each).`);
+    }
+    retainedItems += 1;
+    retainedChars += text.length;
+    return { text, truncated, originalLength: original.length };
+  };
+
+  const trustedParts = [];
+  for (const value of Array.isArray(context.trusted) ? context.trusted : []) {
+    const held = retain(value, 'trusted context');
+    if (held) trustedParts.push(held.text);
+  }
+  const trustedText = trustedParts.join('\n');
+
   const sources = [];
-  for (const [i, src] of (context.untrusted || []).entries()) {
+  const rawSources = Array.isArray(context.untrusted) ? context.untrusted : [];
+  for (const [i, input] of rawSources.entries()) {
+    const src = input && typeof input === 'object' ? input : { text: input };
     const trust = src.trust === 'internal' ? 'internal' : 'untrusted';
     if (trust === 'internal' && policy.trustInternal) continue;
-    const injection = scoreInjection(src.text || '');
+    const held = retain(src.text || '', 'untrusted context');
+    if (!held) continue;
+    const scan = scanUntrustedSource(input, held.text);
     sources.push({
       id: src.id || `source-${i + 1}`,
       origin: src.origin || 'untrusted content',
       trust,
-      text: String(src.text || ''),
-      haystack: lower(injection.deob.analysisText),
-      injection
+      text: held.text,
+      truncated: held.truncated,
+      sourceChars: held.originalLength,
+      haystack: scan.haystack,
+      injection: scan.injection
     });
   }
+
+  const secrets = [];
+  for (const value of [...new Set((context.secrets || []).map(String))]) {
+    if (value.length < 8) continue;
+    const held = retain(value, 'secret context');
+    if (held && held.text.length >= 8) secrets.push(held.text);
+  }
+  const history = Array.isArray(context.history) ? context.history.slice(-256) : [];
+  if (Array.isArray(context.history) && context.history.length > 256) note('Retained tool-call history exceeds 256 entries.');
+
   return {
     prepared: true,
     trustedText,
     trustedLower: lower(deobfuscate(trustedText).text),
     sources,
-    secrets: [...new Set((context.secrets || []).map(String).filter((s) => s.length >= 8))],
-    history: Array.isArray(context.history) ? context.history : []
+    secrets,
+    history,
+    budgetExceeded
   };
 }
 
-export function traceValue(value, ctx) {
+export function traceValue(value, ctx, work = null) {
   const v = lower(deobfuscate(value).text).trim();
-  const result = { endorsed: false, sources: [] };
+  const result = { endorsed: false, sources: [], budgetLimited: false };
   if (!v) return result;
   if (v.length >= 3 && containsToken(ctx.trustedLower, v)) result.endorsed = true;
   for (const src of ctx.sources) {
+    if (!reservePairwiseComparison(work, v, src.haystack)) {
+      result.budgetLimited = true;
+      continue;
+    }
     if (v.length >= 6 && src.haystack.includes(v)) {
       result.sources.push({ id: src.id, origin: src.origin, how: 'verbatim', excerpt: v.slice(0, 80) });
       continue;
@@ -411,7 +479,7 @@ function markdownFindings(markdown, ctx, policy) {
   return out;
 }
 
-function shellFindings(cmd, ctx) {
+function shellFindings(cmd, ctx, work = null) {
   const analysis = analyzeShell(cmd);
   const out = [...analysis.findings];
   for (const c of analysis.commands) {
@@ -431,21 +499,26 @@ function shellFindings(cmd, ctx) {
     let hit = null;
     for (const text of [cmd, ...(analysis.nested || [])]) {
       const textLower = lower(deobfuscate(text).text);
+      let budgetFull = false;
       for (const src of ctx.sources) {
+        if (!reservePairwiseComparison(work, textLower, src.haystack)) {
+          budgetFull = true;
+          break;
+        }
         const run = longestCommonString(textLower, src.haystack);
         if (run.length >= 6 && /[;|&`]|\$\(|\n/.test(run) && !ctx.trustedLower.includes(run)) {
           hit = { rule: 'shellMetaFromUntrusted', severity: 'critical', message: `Shell operators came from ${src.origin}: "${run.trim().slice(0, 60)}".` };
           break;
         }
       }
-      if (hit) break;
+      if (hit || budgetFull) break;
     }
     if (hit) out.push(hit);
   }
   return { analysis, findings: out };
 }
 
-function argFindings(tool, spec, args, ctx, policy) {
+function argFindings(tool, spec, args, ctx, policy, work = null) {
   const findings = [];
   const details = {};
   for (const [name, kind] of Object.entries(spec.args)) {
@@ -463,7 +536,7 @@ function argFindings(tool, spec, args, ctx, policy) {
     } else if (kind === 'url') {
       for (const f of urlFindings(text, ctx, policy, spec.effect === 'egress-write')) findings.push({ ...f, arg: name });
     } else if (kind === 'shell') {
-      const res = shellFindings(text, ctx);
+      const res = shellFindings(text, ctx, work);
       details[name] = { commands: res.analysis.commands.map((c) => c.name).filter(Boolean), features: res.analysis.features };
       for (const f of res.findings) {
         if (f.rule === '__url') for (const g of urlFindings(f.url, ctx, policy, false)) findings.push({ ...g, arg: name });
@@ -485,7 +558,7 @@ function argFindings(tool, spec, args, ctx, policy) {
         for (const f of urlFindings(url, ctx, policy, false)) if (['ssrf', 'homoglyphHost', 'dnsExfil'].includes(f.rule)) findings.push({ ...f, arg: name });
       }
       if (tool === 'write_file' && (/^#!/.test(text) || /\.(sh|bash|zsh|command)$|\/hooks\//.test(String(args.path || '')))) {
-        const script = shellFindings(text, ctx);
+        const script = shellFindings(text, ctx, work);
         for (const f of script.findings) {
           if (f.rule === '__url') {
             for (const g of urlFindings(f.url, ctx, policy, false)) if (g.rule !== 'egressNotAllowed') findings.push({ ...g, arg: name });
@@ -535,31 +608,70 @@ export function evaluateCall(call, context = {}, policy = PRESETS.balanced) {
   }
 }
 
+function budgetFindings(work) {
+  return work.exceeded.map((message) => ({ rule: 'budgetExceeded', severity: 'critical', message }));
+}
+
 function evaluateCallUnsafe(call, rawContext, policy) {
   const ctx = rawContext && rawContext.prepared ? rawContext : prepareContext(rawContext || {}, policy);
+  const work = createWorkBudget();
+  for (const reason of ctx.budgetExceeded || []) exceedBudget(work, reason);
   const tool = call && typeof call.tool === 'string' ? call.tool : '';
-  const spec = TOOL_CATALOG[tool];
-  const toolPolicy = policy.tools[tool];
+  const spec = hasOwn(TOOL_CATALOG, tool) ? TOOL_CATALOG[tool] : null;
+  const toolPolicy = hasOwn(policy.tools, tool) ? policy.tools[tool] : null;
   const findings = [];
   if (!spec || !toolPolicy) {
     findings.push({ rule: 'unknownTool', severity: 'critical', message: `"${tool || '(none)'}" is not an allowed tool.` });
+    findings.push(...budgetFindings(work));
     return finalize(findings, policy, policy.defaultAction === 'allow' ? 'deny' : policy.defaultAction, {}, {});
+  }
+  if (work.exceeded.length) {
+    findings.push(...budgetFindings(work));
+    return finalize(findings, policy, toolPolicy.action, {}, {});
   }
   const args = call.args;
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
     findings.push({ rule: 'badArgs', severity: 'high', message: 'Arguments must be an object.' });
+    findings.push(...budgetFindings(work));
     return finalize(findings, policy, toolPolicy.action, {}, {});
   }
   for (const key of Object.keys(args)) {
-    if (!spec.args[key]) findings.push({ rule: 'badArgs', severity: 'high', message: `Unexpected argument "${key}" for ${tool}.`, arg: key });
+    if (!hasOwn(spec.args, key)) findings.push({ rule: 'badArgs', severity: 'high', message: `Unexpected argument "${key}" for ${tool}.`, arg: key });
   }
-  for (const { path, value } of collectStrings(args)) {
-    if (value.length > toolPolicy.maxArgChars) findings.push({ rule: 'argCap', severity: 'medium', message: `${path} is ${value.length} chars (cap ${toolPolicy.maxArgChars}).`, arg: path });
+  for (const [name, kind] of Object.entries(spec.args)) {
+    if (!hasOwn(args, name)) {
+      if (!(spec.optional || []).includes(name)) findings.push({ rule: 'badArgs', severity: 'high', message: `${name} is required for ${tool}.`, arg: name });
+      continue;
+    }
+    const value = args[name];
+    if (kind === 'amount') {
+      if (typeof value !== 'number' || !Number.isFinite(value)) findings.push({ rule: 'badArgs', severity: 'high', message: `${name} must be a finite number.`, arg: name });
+    } else if (typeof value !== 'string') {
+      findings.push({ rule: 'badArgs', severity: 'high', message: `${name} must be a string.`, arg: name });
+    }
   }
+  if (findings.some((f) => f.rule === 'badArgs')) {
+    findings.push(...budgetFindings(work));
+    return finalize(findings, policy, toolPolicy.action, {}, {});
+  }
+
+  const collected = collectStrings(args, [], '', work);
+  for (const { path, value } of collected) {
+    if (value.length > WORK_LIMITS.maxArgumentChars) {
+      exceedBudget(work, `${path} is ${value.length} chars, above the hard argument cap of ${WORK_LIMITS.maxArgumentChars}.`);
+    } else if (value.length > toolPolicy.maxArgChars) {
+      findings.push({ rule: 'argCap', severity: 'medium', message: `${path} is ${value.length} chars (cap ${toolPolicy.maxArgChars}).`, arg: path });
+    }
+  }
+  if (work.exceeded.length) {
+    findings.push(...budgetFindings(work));
+    return finalize(findings, policy, toolPolicy.action, {}, {});
+  }
+
   const priorCalls = ctx.history.filter((h) => h && h.tool === tool).length;
   if (priorCalls >= toolPolicy.maxCalls) findings.push({ rule: 'rateLimit', severity: 'high', message: `${tool} already ran ${priorCalls} times (cap ${toolPolicy.maxCalls}).` });
 
-  const { findings: argF, details } = argFindings(tool, spec, args, ctx, policy);
+  const { findings: argF, details } = argFindings(tool, spec, args, ctx, policy, work);
   findings.push(...argF);
 
   // Taint: which argument values were copied from untrusted content?
@@ -567,9 +679,10 @@ function evaluateCallUnsafe(call, rawContext, policy) {
   for (const name of Object.keys(spec.args)) {
     const value = args[name];
     if (typeof value !== 'string' || !value) continue;
-    const trace = traceValue(value, ctx);
+    const trace = traceValue(value, ctx, work);
     if (trace.sources.length) provenance[name] = trace;
   }
+  findings.push(...budgetFindings(work));
   const taintedArgs = Object.entries(provenance).filter(([, t]) => t.sources.length && !t.endorsed);
   if (spec.privileged && taintedArgs.length) {
     const [arg, t] = taintedArgs[0];
@@ -592,17 +705,21 @@ function evaluateCallUnsafe(call, rawContext, policy) {
 function finalize(rawFindings, policy, baseAction, provenance, details, spec) {
   const seen = new Set();
   const findings = [];
+  const policyRules = policy && policy.rules && typeof policy.rules === 'object' ? policy.rules : {};
   for (const f of rawFindings) {
     const key = `${f.rule}|${f.message}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const action = policy.rules[f.rule] || 'deny';
-    findings.push({ ...f, severity: f.severity || (RULES[f.rule] ? RULES[f.rule][0] : 'high'), action });
+    const configured = hasOwn(policyRules, f.rule) ? policyRules[f.rule] : 'deny';
+    const action = FAIL_CLOSED_RULES.has(f.rule) || !ACTIONS.includes(configured) ? 'deny' : configured;
+    const severity = f.severity || (hasOwn(RULES, f.rule) ? RULES[f.rule][0] : 'high');
+    findings.push({ ...f, severity, action });
   }
   const matched = [];
-  if (spec) matched.push({ rule: 'tool', action: baseAction });
+  const safeBase = ACTIONS.includes(baseAction) ? baseAction : 'deny';
+  if (spec) matched.push({ rule: 'tool', action: safeBase });
   for (const f of findings) matched.push({ rule: f.rule, action: f.action });
-  const decision = strictestAction([spec ? baseAction : 'allow', ...findings.map((f) => f.action)]);
+  const decision = strictestAction([spec ? safeBase : 'allow', ...findings.map((f) => f.action)]);
   const risk = Math.round(combineWeights(findings.map((f) => SEVERITY_WEIGHT[f.severity] ?? 0.5)) * 100);
   findings.sort((a, b) => actionRank(b.action) - actionRank(a.action) || (SEVERITY_WEIGHT[b.severity] || 0) - (SEVERITY_WEIGHT[a.severity] || 0));
   return { decision, risk, findings, matched, provenance, details, effect: spec ? spec.effect : 'unknown' };

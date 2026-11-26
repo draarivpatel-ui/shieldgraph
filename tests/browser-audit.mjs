@@ -247,11 +247,17 @@ async function main() {
     await theme('light');
     await click('.scn[data-id="issue-shell-meta"]', 'scenario issue-shell-meta');
     check('clicking a scenario loads it', (await text('#scn-title')) === 'Issue Title Injects a Reverse Shell');
+    check('scenario button keeps focus after pointer activation', (await cdp.eval('document.activeElement?.dataset?.id || document.activeElement?.tagName')) === 'issue-shell-meta');
+    await key('Enter');
+    check('scenario button keeps focus after Enter activation', (await cdp.eval('document.activeElement?.dataset?.id || document.activeElement?.tagName')) === 'issue-shell-meta');
     check('reverse shell scenario verdict is Blocked', (await text('#scn-verdict')).includes('Blocked'));
     check('inspector auto-selects the blocked call with its rules', /shellMetaFromUntrusted/.test(await text('#insp-body')) && /reverseShell/.test(await text('#insp-body')));
     await click('#graph .gn[data-id="s1"]', 'source node');
     check('clicking the source node shows injection analysis', /Injection/.test(await text('#insp-body')) && /issue tracker/.test(await text('#insp-body')));
     check('graph node exposes pressed state', (await cdp.eval(`document.querySelector('#graph .gn[data-id="s1"]').getAttribute('aria-pressed')`)) === 'true');
+    const traceText = await text('#text-trace-body');
+    check('accessible text trace carries source to rule to effect', /-> cmd/.test(traceText) && /shellMetaFromUntrusted/.test(traceText) && /not reached/.test(traceText), traceText.slice(0, 90));
+    check('text trace is a labelled disclosure', Boolean(await cdp.eval(`document.querySelector('#text-trace summary')`)));
 
     await click('.scn[data-id="env-b64-exfil"]');
     await click('#graph .gn[data-id="s1"]');
@@ -295,7 +301,8 @@ async function main() {
     const setField = async (sel, value) => {
       await cdp.eval(`(() => { const t = document.querySelector(${JSON.stringify(sel)}); t.focus(); t.select(); return true; })()`);
       await cdp.send('Input.insertText', { text: value });
-      await sleep(250);
+      await cdp.eval(`(() => { const t = document.querySelector(${JSON.stringify(sel)}); t.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+      await sleep(300);
     };
     check('playground starts with a blocked verdict', /Blocked/.test(await text('#pg-verdict')));
     for (const f of ['base64', 'zerowidth', 'homoglyph', 'percent', 'entities']) {
@@ -335,6 +342,8 @@ async function main() {
     check('rules table edit rewrites the manifest', /"taintedExec": "deny"/.test(await cdp.eval(`document.getElementById('pol-json').value`)));
     await click('#tab-benchmark');
     check('benchmark gains a Custom row', /Custom/.test(await text('#metrics-table tbody')));
+    check('benchmark separates denied and held counts', /Denied/.test(await text('#metrics-table thead')) && /Held for approval/.test(await text('#metrics-table thead')));
+    check('known misses and holdout notes are visible', /independent holdout set/.test(await text('.misses')) && /DNS rebinding/.test(await text('.misses')));
     await shot('desktop-benchmark-custom-light');
 
     // Export: guard and policy downloads, then run the downloaded guard in Node.
