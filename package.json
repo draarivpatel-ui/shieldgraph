@@ -9,7 +9,11 @@
     "test": "node --test --test-concurrency=1",
     "audit": "node tests/browser-audit.mjs",
     "guard": "node tools/build-guard.mjs",
-    "serve": "node tools/serve.mjs"
+    "serve": "node tools/serve.mjs",
+    "test:fuzz": "node --test test/fuzz.test.js"
   },
-  "engines": { "node": ">=22.0.0" }
+  "engines": { "node": ">=22.0.0" },
+  "devDependencies": {
+    "fast-check": "4.10.3"
+  }
 }
