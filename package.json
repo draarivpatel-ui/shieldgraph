@@ -6,7 +6,7 @@
   "description": "Browser-native agent tool-call firewall and prompt-injection red-team workbench. Zero dependencies, zero API keys.",
   "license": "MIT",
   "scripts": {
-    "test": "node --test --test-concurrency=1",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
     "audit": "node tests/browser-audit.mjs",
     "guard": "node tools/build-guard.mjs",
     "serve": "node tools/serve.mjs",
